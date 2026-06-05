@@ -1,0 +1,34 @@
+# Frontend
+node_modules/
+dist/
+
+# Backend runtime
+backend/.venv/
+backend/data/*.sqlite3
+backend/data/*.sqlite3-*
+backend/google-service-account.json
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+
+# Internal working context
+vault/
+.lazyweb/
+
+# Python / caches / logs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+logs/
+
+# Archives and OS files
+*.zip
+*.7z
+*.rar
+.DS_Store
+Thumbs.db
