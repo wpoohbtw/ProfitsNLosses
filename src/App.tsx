@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ClipboardList,
   History,
+  Home,
   Landmark,
   Layers3,
   LayoutDashboard,
@@ -1458,8 +1459,8 @@ function App() {
             <Landmark size={20} />
           </div>
           <div>
-            <strong>PNL Lab</strong>
-            <span>Tape Carbon</span>
+            <strong>ProfitsNLosses</strong>
+            <span>{"\u041a\u0440\u0438\u043f\u0442\u043e PnL"}</span>
           </div>
         </div>
 
@@ -1480,6 +1481,10 @@ function App() {
             <ClipboardList size={18} />
             <span>Ситуации</span>
           </button>
+          <a className="rail-link rail-link-home" href="/" title="Вернуться на главную страницу">
+            <Home size={18} />
+            <span>{"\u0413\u043b\u0430\u0432\u043d\u0430\u044f"}</span>
+          </a>
         </nav>
       </aside>
 

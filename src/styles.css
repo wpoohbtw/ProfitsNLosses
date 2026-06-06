@@ -186,6 +186,12 @@ button {
   color: var(--text);
 }
 
+.rail-link-home {
+  order: -1;
+  margin-bottom: 10px;
+  border-color: var(--line);
+}
+
 .workspace {
   position: relative;
   z-index: 1;
