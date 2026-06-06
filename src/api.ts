@@ -7,6 +7,9 @@ import type {
   ProfitCalendarResponse,
   ExchangeTransferPayload,
   SituationCreatePayload,
+  SituationSettings,
+  SituationSettingsPayload,
+  SituationSettingsTestResponse,
   SituationsResponse,
   TradeClosePayload,
   TradeCreatePayload,
@@ -105,6 +108,23 @@ export function updateSituation(rowNumber: number, payload: SituationCreatePaylo
 export function deleteSituation(rowNumber: number): Promise<{ status: string }> {
   return request(`/situations/${rowNumber}`, {
     method: "DELETE"
+  });
+}
+
+export function getSituationSettings(): Promise<SituationSettings> {
+  return request<SituationSettings>("/situations/settings");
+}
+
+export function updateSituationSettings(payload: SituationSettingsPayload): Promise<SituationSettings> {
+  return request<SituationSettings>("/situations/settings", {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function testSituationSettings(): Promise<SituationSettingsTestResponse> {
+  return request<SituationSettingsTestResponse>("/situations/settings/test", {
+    method: "POST"
   });
 }
 

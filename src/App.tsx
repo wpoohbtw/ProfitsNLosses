@@ -35,14 +35,17 @@ import {
   getMarketSymbols,
   getMarketWsUrl,
   getProfitCalendar,
+  getSituationSettings,
   getSituations,
   getTrades,
   realizeTradePnl,
   resetExchangePnl,
   revertClosedTrade,
+  testSituationSettings,
   transferBetweenExchanges,
   updateTradeGroupComment,
   updateSituation,
+  updateSituationSettings,
   updateExchangeBalance
 } from "./api";
 import type {
@@ -54,6 +57,8 @@ import type {
   MarketSymbol,
   ProfitCalendarResponse,
   Situation,
+  SituationSettings,
+  SituationSettingsTestResponse,
   Trade,
   TradeSide,
   TradeSizeUnit
@@ -173,6 +178,12 @@ type SituationModalState = {
   rowNumber?: number;
 };
 
+type SituationSettingsDraft = {
+  credentialsPath: string;
+  spreadsheetId: string;
+  sheetName: string;
+};
+
 const EXCHANGE_ORDER = [
   "binance",
   "bybit",
@@ -182,7 +193,8 @@ const EXCHANGE_ORDER = [
   "bitget",
   "kucoin",
   "hyperliquid",
-  "aster"
+  "aster",
+  "okx"
 ];
 
 const TOKENS: TokenMock[] = [
@@ -231,7 +243,7 @@ const sizeUsdtFormatter = new Intl.NumberFormat("ru-RU", {
 const ACTIVE_PAGE_STORAGE_KEY = "profits-n-losses-active-page";
 const TRADE_TICKETS_STORAGE_KEY = "profits-n-losses-trade-tickets";
 const OPEN_POSITIONS_STORAGE_KEY = "profits-n-losses-open-positions";
-const LIVE_EXCHANGE_SLUGS = new Set(["aster", "binance", "bingx", "bitget", "bybit", "gate", "hyperliquid", "kucoin", "mexc"]);
+const LIVE_EXCHANGE_SLUGS = new Set(["aster", "binance", "bingx", "bitget", "bybit", "gate", "hyperliquid", "kucoin", "mexc", "okx"]);
 const ORDERBOOK_VISIBLE_LEVELS = 5;
 
 function formatMoney(value: number): string {
@@ -417,6 +429,34 @@ function tradeToClosedPosition(trade: Trade): ClosedPosition | null {
   };
 }
 
+function tradeToOpenPosition(trade: Trade): OpenPosition | null {
+  if (trade.status !== "open") {
+    return null;
+  }
+
+  return {
+    id: trade.id,
+    groupId: trade.groupId,
+    tradeId: trade.id,
+    exchangeId: trade.exchangeId,
+    exchangeSlug: trade.exchangeSlug,
+    exchangeName: trade.exchangeName,
+    symbol: trade.symbol,
+    side: trade.side,
+    marginMode: trade.marginMode,
+    leverage: trade.leverage,
+    entryPrice: trade.entryPrice,
+    sizeValue: trade.sizeValue,
+    sizeUnit: trade.sizeUnit,
+    notionalUsdt: trade.notionalUsdt,
+    marginUsdt: trade.marginUsdt,
+    realizedPnlUsdt: trade.realizedPnlUsdt,
+    realizedPricePnlUsdt: trade.realizedPnlUsdt,
+    lastFundingAppliedAt: trade.lastFundingAppliedAt,
+    openedAt: trade.openedAt
+  };
+}
+
 function getNextTicketId(tickets: TradeTicket[]): number {
   return tickets.reduce((maxId, ticket) => Math.max(maxId, ticket.id), 0) + 1;
 }
@@ -487,11 +527,6 @@ function getPositionPnlAtPrice(position: OpenPosition, closePrice: number): { pn
   const pnlUsdt = (closePrice - position.entryPrice) * quantity * direction;
   const pnlPercent = position.marginUsdt > 0 ? (pnlUsdt / position.marginUsdt) * 100 : 0;
   return { pnlUsdt, pnlPercent, closePrice };
-}
-
-function getPositionFundingPnl(position: OpenPosition, fundingInfo: FundingInfo): number {
-  const direction = position.side === "long" ? -1 : 1;
-  return roundInput(getPositionCloseNotional(position) * fundingInfo.fundingRate * direction);
 }
 
 function getPositionCloseNotional(position: OpenPosition): number {
@@ -694,6 +729,14 @@ function App() {
   const [positionSnapshots, setPositionSnapshots] = useState<Record<number, MarketSnapshot>>({});
   const [expandedSymbols, setExpandedSymbols] = useState<Record<string, boolean>>({});
   const [situations, setSituations] = useState<Situation[]>([]);
+  const [situationSettings, setSituationSettings] = useState<SituationSettings | null>(null);
+  const [situationSettingsDraft, setSituationSettingsDraft] = useState<SituationSettingsDraft>({
+    credentialsPath: "backend/google-service-account.json",
+    spreadsheetId: "",
+    sheetName: "Situations"
+  });
+  const [situationSettingsCheck, setSituationSettingsCheck] = useState<SituationSettingsTestResponse | null>(null);
+  const [isSituationSettingsOpen, setIsSituationSettingsOpen] = useState(false);
   const [situationDraft, setSituationDraft] = useState<SituationDraft>({
     date: new Date().toISOString().slice(0, 10),
     token: "",
@@ -707,6 +750,7 @@ function App() {
   const [depositDraft, setDepositDraft] = useState<DepositDraft | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSituationsLoading, setIsSituationsLoading] = useState(false);
+  const [isSituationSettingsLoading, setIsSituationSettingsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -724,15 +768,19 @@ function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const [exchangePayload, calendarPayload, closedTradesPayload] = await Promise.all([
+      const [exchangePayload, calendarPayload, openTradesPayload, closedTradesPayload] = await Promise.all([
         getExchanges(),
         getProfitCalendar(targetMonth.year, targetMonth.month),
+        getTrades("open"),
         getTrades("closed")
       ]);
       const sortedExchanges = sortExchanges(exchangePayload.exchanges);
+      const backendOpenPositions = openTradesPayload.trades.map(tradeToOpenPosition).filter((position): position is OpenPosition => position !== null);
       setExchanges(sortedExchanges);
       setSummary(exchangePayload.summary);
       setCalendar(calendarPayload);
+      setOpenPositions(backendOpenPositions);
+      setNextPositionId(getNextPositionId(backendOpenPositions));
       setClosedPositions(closedTradesPayload.trades.map(tradeToClosedPosition).filter((position): position is ClosedPosition => position !== null));
       setTickets((current) => current.map((ticket) => normalizeTicketExchange(ticket, sortedExchanges)));
     } catch (caughtError) {
@@ -752,6 +800,75 @@ function App() {
       setError(caughtError instanceof Error ? caughtError.message : "Не удалось загрузить ситуации");
     } finally {
       setIsSituationsLoading(false);
+    }
+  }
+
+  function applySituationSettings(settings: SituationSettings) {
+    setSituationSettings(settings);
+    setSituationSettingsDraft({
+      credentialsPath: settings.credentialsPath || "backend/google-service-account.json",
+      spreadsheetId: settings.spreadsheetId || "",
+      sheetName: settings.sheetName || "Situations"
+    });
+  }
+
+  async function loadSituationSettings() {
+    setIsSituationSettingsLoading(true);
+    setError(null);
+    try {
+      const settings = await getSituationSettings();
+      applySituationSettings(settings);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Не удалось загрузить настройки ситуаций");
+    } finally {
+      setIsSituationSettingsLoading(false);
+    }
+  }
+
+  async function openSituationSettingsModal() {
+    setIsSituationSettingsOpen(true);
+    setSituationSettingsCheck(null);
+    await loadSituationSettings();
+  }
+
+  function closeSituationSettingsModal() {
+    if (isSaving || isSituationSettingsLoading) {
+      return;
+    }
+    setIsSituationSettingsOpen(false);
+    setSituationSettingsCheck(null);
+  }
+
+  async function handleSaveSituationSettings() {
+    setIsSaving(true);
+    setError(null);
+    try {
+      const settings = await updateSituationSettings({
+        credentials_path: situationSettingsDraft.credentialsPath.trim() || "backend/google-service-account.json",
+        spreadsheet_id: situationSettingsDraft.spreadsheetId.trim(),
+        sheet_name: situationSettingsDraft.sheetName.trim() || "Situations"
+      });
+      applySituationSettings(settings);
+      setSituationSettingsCheck(null);
+      await loadSituations();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Не удалось сохранить настройки ситуаций");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function handleTestSituationSettings() {
+    setIsSituationSettingsLoading(true);
+    setError(null);
+    try {
+      const result = await testSituationSettings();
+      setSituationSettingsCheck(result);
+      applySituationSettings(result.settings);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Не удалось проверить Google Sheets");
+    } finally {
+      setIsSituationSettingsLoading(false);
     }
   }
 
@@ -1088,7 +1205,7 @@ function App() {
         margin_mode: marginMode
       });
       const nextPosition: OpenPosition = {
-        id: nextPositionId,
+        id: createdTrade.tradeId,
         groupId,
         tradeId: createdTrade.tradeId,
         exchangeId: exchange.id,
@@ -1110,7 +1227,7 @@ function App() {
       };
       setOpenPositions((current) => [...current, nextPosition]);
       setExpandedSymbols((current) => ({ ...current, [symbol]: true }));
-      setNextPositionId((current) => current + 1);
+      setNextPositionId((current) => Math.max(current, createdTrade.tradeId + 1));
       removeTicket(ticket.id);
       setOpenTradeDraft(null);
     } catch (caughtError) {
@@ -1158,7 +1275,7 @@ function App() {
     ) * (closePercent / 100);
 
     if (closePercent >= 99.999) {
-      const totalRealizedPnl = roundInput(positionToClose.realizedPricePnlUsdt + realizedPnlDelta);
+      const totalRealizedPnl = roundInput(positionToClose.realizedPnlUsdt + realizedPnlDelta);
       const closedPosition: ClosedPosition = {
         id: positionToClose.id,
         groupId: positionToClose.groupId,
@@ -1214,9 +1331,14 @@ function App() {
         setIsSaving(true);
         try {
           await realizeTradePnl(positionToClose.tradeId, {
-            realized_pnl_usdt: realizedPnlDelta
+            realized_pnl_usdt: realizedPnlDelta,
+            size_value: roundInput(positionToClose.sizeValue * multiplier),
+            notional_usdt: roundInput(positionToClose.notionalUsdt * multiplier),
+            margin_usdt: roundInput(positionToClose.marginUsdt * multiplier)
           });
           await loadData();
+          setCloseTradeDraft(null);
+          return;
         } catch (caughtError) {
           setError(caughtError instanceof Error ? caughtError.message : "Не удалось зафиксировать частичный PnL");
           setIsSaving(false);
@@ -1284,25 +1406,6 @@ function App() {
       setIsSaving(false);
     }
   }
-
-  const applyFunding = useCallback((positionId: number, fundingInfo: FundingInfo, force = false) => {
-    setOpenPositions((current) =>
-      current.map((position) => {
-        if (position.id !== positionId) {
-          return position;
-        }
-        if (!force && position.lastFundingAppliedAt === fundingInfo.nextFundingTime) {
-          return position;
-        }
-        const fundingPnl = getPositionFundingPnl(position, fundingInfo);
-        return {
-          ...position,
-          realizedPnlUsdt: roundInput(position.realizedPnlUsdt + fundingPnl),
-          lastFundingAppliedAt: force ? position.lastFundingAppliedAt : fundingInfo.nextFundingTime
-        };
-      })
-    );
-  }, []);
 
   const handlePositionSnapshot = useCallback((positionId: number, snapshot: MarketSnapshot) => {
     setPositionSnapshots((current) => ({
@@ -1376,7 +1479,6 @@ function App() {
             onToggleSymbol={(symbol) => setExpandedSymbols((current) => ({ ...current, [symbol]: !current[symbol] }))}
             onCloseTrade={requestCloseTrade}
             onDeleteTrade={deleteOpenPosition}
-            onApplyFunding={applyFunding}
             onPositionSnapshot={handlePositionSnapshot}
           />
         ) : null}
@@ -1398,6 +1500,7 @@ function App() {
             onDelete={requestDeleteSituation}
             onEdit={openEditSituationModal}
             onOpenCreate={openCreateSituationModal}
+            onOpenSettings={() => void openSituationSettingsModal()}
             onRefresh={() => void loadSituations()}
           />
         ) : null}
@@ -1443,6 +1546,20 @@ function App() {
           situation={situationDeleteDraft}
           onClose={closeSituationDeleteModal}
           onConfirm={() => void handleDeleteSituation()}
+        />
+      ) : null}
+
+      {isSituationSettingsOpen ? (
+        <SituationSettingsModal
+          checkResult={situationSettingsCheck}
+          draft={situationSettingsDraft}
+          isLoading={isSituationSettingsLoading}
+          isSaving={isSaving}
+          settings={situationSettings}
+          onChange={setSituationSettingsDraft}
+          onClose={closeSituationSettingsModal}
+          onSave={() => void handleSaveSituationSettings()}
+          onTest={() => void handleTestSituationSettings()}
         />
       ) : null}
 
@@ -1553,7 +1670,6 @@ type TradesPageProps = {
   onOpenTrade: (ticket: TradeTicket, snapshot?: MarketSnapshot | null) => void;
   onCloseTrade: (position: OpenPosition) => void;
   onDeleteTrade: (position: OpenPosition) => void;
-  onApplyFunding: (positionId: number, fundingInfo: FundingInfo, force?: boolean) => void;
   onToggleSymbol: (symbol: string) => void;
   onPositionSnapshot: (positionId: number, snapshot: MarketSnapshot) => void;
 };
@@ -1570,7 +1686,6 @@ function TradesPage({
   onOpenTrade,
   onCloseTrade,
   onDeleteTrade,
-  onApplyFunding,
   onToggleSymbol,
   onPositionSnapshot
 }: TradesPageProps) {
@@ -1600,7 +1715,6 @@ function TradesPage({
         expandedSymbols={expandedSymbols}
         onCloseTrade={onCloseTrade}
         onDeleteTrade={onDeleteTrade}
-        onApplyFunding={onApplyFunding}
         onPositionSnapshot={onPositionSnapshot}
         onToggleSymbol={onToggleSymbol}
       />
@@ -1843,6 +1957,7 @@ function SituationsPage({
   onDelete,
   onEdit,
   onOpenCreate,
+  onOpenSettings,
   onRefresh,
 }: {
   error: string | null;
@@ -1852,6 +1967,7 @@ function SituationsPage({
   onDelete: (situation: Situation) => void;
   onEdit: (situation: Situation) => void;
   onOpenCreate: () => void;
+  onOpenSettings: () => void;
   onRefresh: () => void;
 }) {
   const [searchDraft, setSearchDraft] = useState("");
@@ -1911,6 +2027,9 @@ function SituationsPage({
           </div>
           <button className="ghost-action compact-action icon-only-action" type="button" onClick={onRefresh} disabled={isLoading || isSaving} aria-label="Обновить">
             <RotateCcw size={16} />
+          </button>
+          <button className="ghost-action compact-action icon-only-action" type="button" onClick={onOpenSettings} disabled={isSaving} aria-label="Настройки ситуаций">
+            <Settings2 size={16} />
           </button>
         </div>
       </div>
@@ -2458,7 +2577,6 @@ type OpenPositionsPanelProps = {
   expandedSymbols: Record<string, boolean>;
   onCloseTrade: (position: OpenPosition) => void;
   onDeleteTrade: (position: OpenPosition) => void;
-  onApplyFunding: (positionId: number, fundingInfo: FundingInfo, force?: boolean) => void;
   onToggleSymbol: (symbol: string) => void;
   onPositionSnapshot: (positionId: number, snapshot: MarketSnapshot) => void;
 };
@@ -2470,7 +2588,6 @@ function OpenPositionsPanel({
   expandedSymbols,
   onCloseTrade,
   onDeleteTrade,
-  onApplyFunding,
   onToggleSymbol,
   onPositionSnapshot
 }: OpenPositionsPanelProps) {
@@ -2514,7 +2631,6 @@ function OpenPositionsPanel({
         <PositionFundingFeed
           fundingInfo={fundingInfos[position.id] ?? null}
           key={`funding-${position.id}`}
-          onApplyFunding={onApplyFunding}
           onFundingInfo={handleFundingInfo}
           position={position}
         />
@@ -2652,12 +2768,10 @@ function PositionMarketFeed({
 
 function PositionFundingFeed({
   fundingInfo,
-  onApplyFunding,
   onFundingInfo,
   position
 }: {
   fundingInfo: FundingInfo | null;
-  onApplyFunding: (positionId: number, fundingInfo: FundingInfo, force?: boolean) => void;
   onFundingInfo: (positionId: number, fundingInfo: FundingInfo) => void;
   position: OpenPosition;
 }) {
@@ -2670,7 +2784,6 @@ function PositionFundingFeed({
   useEffect(() => {
     let isClosed = false;
     let pollTimer: number | null = null;
-    let tickTimer: number | null = null;
 
     function fetchFunding() {
       void getMarketFunding(position.exchangeSlug, position.symbol)
@@ -2686,25 +2799,14 @@ function PositionFundingFeed({
 
     fetchFunding();
     pollTimer = window.setInterval(fetchFunding, 30_000);
-    tickTimer = window.setInterval(() => {
-      const currentFunding = fundingRef.current;
-      if (!currentFunding || !currentFunding.nextFundingTime || currentFunding.nextFundingTime > Date.now()) {
-        return;
-      }
-      onApplyFunding(position.id, currentFunding, false);
-      fetchFunding();
-    }, 1000);
 
     return () => {
       isClosed = true;
       if (pollTimer) {
         window.clearInterval(pollTimer);
       }
-      if (tickTimer) {
-        window.clearInterval(tickTimer);
-      }
     };
-  }, [onApplyFunding, onFundingInfo, position.exchangeSlug, position.id, position.symbol]);
+  }, [onFundingInfo, position.exchangeSlug, position.id, position.symbol]);
 
   return null;
 }
@@ -2957,7 +3059,6 @@ function ExchangePanel({ exchanges, isLoading, onEdit }: ExchangePanelProps) {
                     <span>{exchange.name}</span>
                     <ExchangeNetworkWarning exchange={exchange} />
                   </strong>
-                  <span>{exchange.slug.toUpperCase()}</span>
                 </div>
               </div>
               <div className="metric-cell">
@@ -3573,6 +3674,105 @@ function DepositModal({ draft, exchanges, isSaving, onChange, onClose, onSave }:
           <button className="primary-action" type="button" onClick={onSave} disabled={isSaving}>
             <Save size={16} />
             <span>{isSaving ? "Перевод" : "Сохранить"}</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SituationSettingsModal({
+  checkResult,
+  draft,
+  isLoading,
+  isSaving,
+  settings,
+  onChange,
+  onClose,
+  onSave,
+  onTest
+}: {
+  checkResult: SituationSettingsTestResponse | null;
+  draft: SituationSettingsDraft;
+  isLoading: boolean;
+  isSaving: boolean;
+  settings: SituationSettings | null;
+  onChange: (draft: SituationSettingsDraft) => void;
+  onClose: () => void;
+  onSave: () => void;
+  onTest: () => void;
+}) {
+  const checks = checkResult?.checks ?? [
+    { key: "credentials", label: "JSON файл", ok: Boolean(settings?.credentialsExists) },
+    { key: "spreadsheet", label: "Google Sheet ID", ok: Boolean(settings?.spreadsheetId) },
+    { key: "sheet", label: "Вкладка", ok: false },
+    { key: "write", label: "Доступ Google Sheets", ok: false }
+  ];
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="trade-confirm-modal situation-settings-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="modal-close-button" type="button" onClick={onClose} disabled={isSaving || isLoading} aria-label="Закрыть">
+          <X size={18} />
+        </button>
+
+        <p className="modal-kicker">Google Sheets</p>
+        <h2>Настройки</h2>
+
+        <div className="situation-settings-grid">
+          <label className="field situation-settings-wide">
+            <span>Google Sheet ID</span>
+            <input
+              value={draft.spreadsheetId}
+              placeholder="ID таблицы из ссылки"
+              onChange={(event) => onChange({ ...draft, spreadsheetId: event.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span>Вкладка</span>
+            <input
+              value={draft.sheetName}
+              placeholder="Situations"
+              onChange={(event) => onChange({ ...draft, sheetName: event.target.value })}
+            />
+          </label>
+          <label className="field situation-settings-wide">
+            <span>Путь к JSON</span>
+            <input
+              value={draft.credentialsPath}
+              placeholder="backend/google-service-account.json"
+              onChange={(event) => onChange({ ...draft, credentialsPath: event.target.value })}
+            />
+          </label>
+          <div className="settings-readonly-card">
+            <span>Service account</span>
+            <strong>{settings?.serviceAccountEmail || "JSON не прочитан"}</strong>
+          </div>
+          <div className="settings-readonly-card">
+            <span>Resolved path</span>
+            <strong>{settings?.resolvedCredentialsPath || "—"}</strong>
+          </div>
+        </div>
+
+        <div className="settings-check-list">
+          {checks.map((check) => (
+            <div className={check.ok ? "settings-check is-ok" : "settings-check is-bad"} key={check.key}>
+              <span>{check.label}</span>
+              <strong>{check.ok ? "OK" : "—"}</strong>
+            </div>
+          ))}
+        </div>
+
+        {checkResult?.message ? <div className="error-banner settings-check-error">{checkResult.message}</div> : null}
+
+        <div className="modal-actions situation-modal-actions">
+          <button className="ghost-action" type="button" onClick={onTest} disabled={isLoading || isSaving}>
+            <RotateCcw size={16} />
+            <span>{isLoading ? "Проверка" : "Проверить"}</span>
+          </button>
+          <button className="primary-action" type="button" onClick={onSave} disabled={isLoading || isSaving}>
+            <Save size={16} />
+            <span>{isSaving ? "Сохранение" : "Сохранить"}</span>
           </button>
         </div>
       </section>

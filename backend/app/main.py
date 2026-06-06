@@ -2,16 +2,26 @@ from __future__ import annotations
 
 from calendar import monthrange
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
+import time
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .db import fetch_all, get_connection, initialize_database
-from .market_data import get_market_funding, get_market_snapshot, get_market_symbols, stream_market_data
-from .situations import SituationsConfigError, append_situation, delete_situation, list_situations, update_situation
+from .db import fetch_all, get_connection, initialize_database, rebuild_daily_profit
+from .market_data import get_market_funding, get_market_funding_history_sync, get_market_funding_sync, get_market_snapshot, get_market_symbols, stream_market_data
+from .situations import (
+    SituationsConfigError,
+    append_situation,
+    delete_situation,
+    get_situations_settings,
+    list_situations,
+    test_situations_connection,
+    update_situation,
+    update_situations_settings,
+)
 
 app = FastAPI(title="ProfitsNLosses API", version="0.1.0")
 
@@ -53,6 +63,9 @@ class TradeClose(BaseModel):
 
 class TradeRealizePnl(BaseModel):
     realized_pnl_usdt: float
+    size_value: float | None = Field(default=None, gt=0)
+    notional_usdt: float | None = Field(default=None, gt=0)
+    margin_usdt: float | None = Field(default=None, gt=0)
 
 
 class ExchangeTransfer(BaseModel):
@@ -72,6 +85,12 @@ class SituationCreate(BaseModel):
     posts: str = Field(default="", max_length=2000)
 
 
+class SituationSettingsUpdate(BaseModel):
+    credentials_path: str = Field(min_length=1, max_length=300)
+    spreadsheet_id: str = Field(default="", max_length=180)
+    sheet_name: str = Field(default="Situations", min_length=1, max_length=80)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     initialize_database()
@@ -80,6 +99,25 @@ def on_startup() -> None:
 @app.get("/api/v1/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/v1/situations/settings")
+def get_situation_settings() -> dict[str, object]:
+    return get_situations_settings()
+
+
+@app.put("/api/v1/situations/settings")
+def save_situation_settings(payload: SituationSettingsUpdate) -> dict[str, object]:
+    return update_situations_settings(
+        credentials_path=payload.credentials_path,
+        spreadsheet_id=payload.spreadsheet_id,
+        sheet_name=payload.sheet_name,
+    )
+
+
+@app.post("/api/v1/situations/settings/test")
+def test_situation_settings() -> dict[str, object]:
+    return test_situations_connection()
 
 
 @app.get("/api/v1/situations")
@@ -188,6 +226,7 @@ def list_exchanges() -> dict[str, object]:
             WHEN 'kucoin' THEN 7
             WHEN 'hyperliquid' THEN 8
             WHEN 'aster' THEN 9
+            WHEN 'okx' THEN 10
             ELSE 99
         END
         """
@@ -250,6 +289,7 @@ def insert_balance_event(
     start_balance_before: float | None,
     start_balance_after: float,
     note: str | None = None,
+    created_at: str | None = None,
 ) -> None:
     connection.execute(
         """
@@ -261,9 +301,10 @@ def insert_balance_event(
             start_balance_before_usdt,
             start_balance_after_usdt,
             pnl_after_usdt,
-            note
+            note,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
         """,
         (
             exchange_id,
@@ -274,11 +315,12 @@ def insert_balance_event(
             start_balance_after,
             balance_after - start_balance_after,
             note,
+            created_at,
         ),
     )
 
 
-def add_daily_profit_delta(connection, pnl_delta: float) -> None:
+def add_daily_profit_delta(connection, pnl_delta: float, profit_date: str | None = None) -> None:
     connection.execute(
         """
         INSERT INTO daily_profit (profit_date, pnl_usdt, source)
@@ -287,7 +329,7 @@ def add_daily_profit_delta(connection, pnl_delta: float) -> None:
         SET pnl_usdt = pnl_usdt + excluded.pnl_usdt,
             source = 'trades'
         """,
-        (date.today().isoformat(), pnl_delta),
+        (profit_date or date.today().isoformat(), pnl_delta),
     )
 
 
@@ -297,6 +339,8 @@ def apply_trade_pnl_delta(
     pnl_delta: float,
     event_type: str,
     note: str,
+    created_at: str | None = None,
+    profit_date: str | None = None,
 ) -> None:
     exchange = fetch_exchange_or_404(connection, exchange_id)
     old_balance = exchange["balance_usdt"]
@@ -318,8 +362,258 @@ def apply_trade_pnl_delta(
         start_balance_before=exchange["start_balance_usdt"],
         start_balance_after=exchange["start_balance_usdt"],
         note=note,
+        created_at=created_at,
     )
-    add_daily_profit_delta(connection, pnl_delta)
+    add_daily_profit_delta(connection, pnl_delta, profit_date)
+
+
+def calculate_trade_price_pnl(side: str, entry_price: float, exit_price: float, size_value: float, size_unit: str) -> float:
+    quantity = size_value / entry_price if size_unit == "USDT" else size_value
+    if side == "short":
+        return (entry_price - exit_price) * quantity
+    return (exit_price - entry_price) * quantity
+
+
+def funding_interval_ms(exchange_slug: str) -> int:
+    hours = 1 if exchange_slug == "hyperliquid" else 8
+    return hours * 60 * 60 * 1000
+
+
+def timestamp_ms_to_sqlite(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def timestamp_ms_to_date(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000).date().isoformat()
+
+
+def parse_sqlite_timestamp_ms(value: str | None) -> int:
+    if not value:
+        return int(time.time() * 1000)
+    try:
+        return int(datetime.fromisoformat(value.replace(" ", "T")).timestamp() * 1000)
+    except ValueError:
+        return int(time.time() * 1000)
+
+
+def get_missed_funding_times(last_applied_at: int, next_funding_time: int, interval_ms: int, now_ms: int) -> list[int]:
+    if not next_funding_time or interval_ms <= 0:
+        return []
+
+    funding_time = next_funding_time - interval_ms
+    missed = []
+    while funding_time > last_applied_at and funding_time <= now_ms and len(missed) < 180:
+        missed.append(funding_time)
+        funding_time -= interval_ms
+    return list(reversed(missed))
+
+
+def calculate_funding_pnl(notional_usdt: float, side: str, funding_rate: float) -> float:
+    direction = -1 if side == "long" else 1
+    return round(float(notional_usdt) * funding_rate * direction, 8)
+
+
+def apply_funding_event(
+    connection,
+    trade,
+    funding_time: int,
+    funding_rate: float,
+    source: str,
+) -> bool:
+    funding_pnl = calculate_funding_pnl(trade["notional_usdt"], trade["side"], funding_rate)
+    existing = connection.execute(
+        """
+        SELECT id, funding_rate, amount_usdt, source
+        FROM funding_events
+        WHERE trade_id = ? AND funding_time = ?
+        """,
+        (trade["id"], funding_time),
+    ).fetchone()
+
+    if existing is not None:
+        if existing["source"] == "historical" or source != "historical":
+            return False
+        delta = funding_pnl - existing["amount_usdt"]
+        if abs(delta) <= 0.00000001:
+            connection.execute(
+                """
+                UPDATE funding_events
+                SET funding_rate = ?, notional_usdt = ?, amount_usdt = ?, source = ?
+                WHERE id = ?
+                """,
+                (funding_rate, trade["notional_usdt"], funding_pnl, source, existing["id"]),
+            )
+            return False
+
+        connection.execute(
+            """
+            UPDATE funding_events
+            SET funding_rate = ?, notional_usdt = ?, amount_usdt = ?, source = ?
+            WHERE id = ?
+            """,
+            (funding_rate, trade["notional_usdt"], funding_pnl, source, existing["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE trades
+            SET realized_pnl_usdt = realized_pnl_usdt + ?,
+                last_funding_applied_at = MAX(COALESCE(last_funding_applied_at, 0), ?)
+            WHERE id = ?
+            """,
+            (delta, funding_time, trade["id"]),
+        )
+        apply_trade_pnl_delta(
+            connection=connection,
+            exchange_id=trade["exchange_id"],
+            pnl_delta=delta,
+            event_type="funding",
+            note=f"Funding correction {trade['symbol']} trade #{trade['id']} at rate {funding_rate}",
+            created_at=timestamp_ms_to_sqlite(funding_time),
+            profit_date=timestamp_ms_to_date(funding_time),
+        )
+        return True
+
+    connection.execute(
+        """
+        INSERT INTO funding_events (
+            trade_id,
+            exchange_id,
+            symbol,
+            funding_time,
+            funding_rate,
+            notional_usdt,
+            side,
+            amount_usdt,
+            source,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trade["id"],
+            trade["exchange_id"],
+            trade["symbol"],
+            funding_time,
+            funding_rate,
+            trade["notional_usdt"],
+            trade["side"],
+            funding_pnl,
+            source,
+            timestamp_ms_to_sqlite(funding_time),
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE trades
+        SET realized_pnl_usdt = realized_pnl_usdt + ?,
+            last_funding_applied_at = MAX(COALESCE(last_funding_applied_at, 0), ?)
+        WHERE id = ?
+        """,
+        (funding_pnl, funding_time, trade["id"]),
+    )
+    apply_trade_pnl_delta(
+        connection=connection,
+        exchange_id=trade["exchange_id"],
+        pnl_delta=funding_pnl,
+        event_type="funding",
+        note=f"Funding {trade['symbol']} trade #{trade['id']} at rate {funding_rate}",
+        created_at=timestamp_ms_to_sqlite(funding_time),
+        profit_date=timestamp_ms_to_date(funding_time),
+    )
+    return True
+
+
+def fetch_trade_funding_history(trade, start_ms: int, end_ms: int) -> list[dict[str, object]]:
+    try:
+        history = get_market_funding_history_sync(trade["exchange_slug"], trade["symbol"], start_ms, end_ms)
+    except Exception:
+        history = []
+    return [
+        event
+        for event in history
+        if start_ms < int(event.get("fundingTime") or 0) <= end_ms
+    ]
+
+
+def sync_funding_for_trade(connection, trade, end_ms: int, prefer_history: bool = True) -> None:
+    opened_ms = parse_sqlite_timestamp_ms(trade["opened_at"])
+    if end_ms <= opened_ms:
+        return
+
+    if prefer_history:
+        history = fetch_trade_funding_history(trade, opened_ms, end_ms)
+        if history:
+            for event in history:
+                apply_funding_event(
+                    connection=connection,
+                    trade=trade,
+                    funding_time=int(event["fundingTime"]),
+                    funding_rate=float(event.get("fundingRate") or 0),
+                    source="historical",
+                )
+            return
+
+    try:
+        funding_info = get_market_funding_sync(trade["exchange_slug"], trade["symbol"])
+    except Exception:
+        return
+
+    funding_rate = float(funding_info.get("fundingRate") or 0)
+    next_funding_time = int(funding_info.get("nextFundingTime") or 0)
+    last_applied_at = trade["last_funding_applied_at"] or opened_ms
+    missed_times = get_missed_funding_times(
+        last_applied_at=last_applied_at,
+        next_funding_time=next_funding_time,
+        interval_ms=funding_interval_ms(trade["exchange_slug"]),
+        now_ms=end_ms,
+    )
+    for funding_time in missed_times:
+        apply_funding_event(connection, trade, funding_time, funding_rate, "current_fallback")
+
+
+def sync_funding_for_trades(connection, status: str = "open") -> None:
+    trades = connection.execute(
+        """
+        SELECT
+            trades.id,
+            trades.exchange_id,
+            exchanges.slug AS exchange_slug,
+            trades.symbol,
+            trades.side,
+            trades.notional_usdt,
+            trades.status,
+            trades.opened_at,
+            trades.closed_at,
+            trades.last_funding_applied_at
+        FROM trades
+        JOIN exchanges ON exchanges.id = trades.exchange_id
+        WHERE trades.status = ?
+        """,
+        (status,),
+    ).fetchall()
+    now_ms = int(time.time() * 1000)
+
+    for trade in trades:
+        end_ms = parse_sqlite_timestamp_ms(trade["closed_at"]) if status == "closed" else now_ms
+        sync_funding_for_trade(connection, trade, end_ms=end_ms, prefer_history=True)
+
+
+def sync_funding_for_open_trades(connection) -> None:
+    sync_funding_for_trades(connection, status="open")
+
+
+def sync_funding_for_closed_trades(connection) -> None:
+    sync_funding_for_trades(connection, status="closed")
+
+
+@app.post("/api/v1/funding/reconcile")
+def reconcile_funding() -> dict[str, str]:
+    with closing(get_connection()) as connection:
+        sync_funding_for_open_trades(connection)
+        sync_funding_for_closed_trades(connection)
+        rebuild_daily_profit(connection)
+        connection.commit()
+    return {"status": "reconciled"}
 
 
 @app.put("/api/v1/exchanges/{exchange_id}/balance")
@@ -459,9 +753,10 @@ def create_trade(payload: TradeCreate) -> dict[str, object]:
                 notional_usdt,
                 margin_usdt,
                 leverage,
-                margin_mode
+                margin_mode,
+                last_funding_applied_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.exchange_id,
@@ -475,6 +770,7 @@ def create_trade(payload: TradeCreate) -> dict[str, object]:
                 payload.margin_usdt,
                 payload.leverage,
                 payload.margin_mode,
+                int(time.time() * 1000),
             ),
         )
         connection.commit()
@@ -491,6 +787,15 @@ def list_trades(status: str | None = "open") -> dict[str, object]:
             raise HTTPException(status_code=400, detail="Некорректный статус сделки")
         where_clause = "WHERE trades.status = ?"
         parameters.append(status)
+
+    if status == "open":
+        with closing(get_connection()) as connection:
+            sync_funding_for_open_trades(connection)
+            connection.commit()
+    elif status == "closed":
+        with closing(get_connection()) as connection:
+            sync_funding_for_closed_trades(connection)
+            connection.commit()
 
     rows = fetch_all(
         f"""
@@ -512,6 +817,7 @@ def list_trades(status: str | None = "open") -> dict[str, object]:
             trades.leverage,
             trades.margin_mode,
             trades.realized_pnl_usdt,
+            trades.last_funding_applied_at,
             trades.comment,
             trades.opened_at,
             trades.closed_at,
@@ -543,6 +849,7 @@ def list_trades(status: str | None = "open") -> dict[str, object]:
             "leverage": row["leverage"],
             "marginMode": row["margin_mode"],
             "realizedPnlUsdt": row["realized_pnl_usdt"],
+            "lastFundingAppliedAt": row["last_funding_applied_at"],
             "comment": row["comment"],
             "openedAt": row["opened_at"],
             "closedAt": row["closed_at"],
@@ -574,9 +881,19 @@ def update_trade_group_comment(group_id: str, payload: TradeGroupComment) -> dic
 @app.post("/api/v1/trades/{trade_id}/close")
 def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
     with closing(get_connection()) as connection:
+        sync_funding_for_open_trades(connection)
         trade = connection.execute(
             """
-            SELECT id, exchange_id, status, symbol, realized_pnl_usdt
+            SELECT
+                id,
+                exchange_id,
+                status,
+                symbol,
+                side,
+                entry_price,
+                size_value,
+                size_unit,
+                realized_pnl_usdt
             FROM trades
             WHERE id = ?
             """,
@@ -586,6 +903,15 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
         if trade["status"] != "open":
             raise HTTPException(status_code=400, detail="Сделка уже не открыта")
+
+        price_pnl = calculate_trade_price_pnl(
+            side=trade["side"],
+            entry_price=trade["entry_price"],
+            exit_price=payload.exit_price,
+            size_value=trade["size_value"],
+            size_unit=trade["size_unit"],
+        )
+        total_realized_pnl = trade["realized_pnl_usdt"] + price_pnl
 
         connection.execute(
             """
@@ -602,7 +928,7 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
             """,
             (
                 payload.exit_price,
-                payload.realized_pnl_usdt,
+                total_realized_pnl,
                 payload.group_id,
                 payload.notional_usdt,
                 payload.leverage,
@@ -613,7 +939,7 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
         apply_trade_pnl_delta(
             connection=connection,
             exchange_id=trade["exchange_id"],
-            pnl_delta=payload.realized_pnl_usdt - trade["realized_pnl_usdt"],
+            pnl_delta=price_pnl,
             event_type="trade_close",
             note=f"Closed {trade['symbol']} trade #{trade_id}",
         )
@@ -625,6 +951,7 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
 @app.post("/api/v1/trades/{trade_id}/realize-pnl")
 def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, object]:
     with closing(get_connection()) as connection:
+        sync_funding_for_open_trades(connection)
         trade = connection.execute(
             """
             SELECT id, exchange_id, status, symbol, realized_pnl_usdt
@@ -641,10 +968,19 @@ def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, obje
         connection.execute(
             """
             UPDATE trades
-            SET realized_pnl_usdt = ?
+            SET realized_pnl_usdt = ?,
+                size_value = COALESCE(?, size_value),
+                notional_usdt = COALESCE(?, notional_usdt),
+                margin_usdt = COALESCE(?, margin_usdt)
             WHERE id = ?
             """,
-            (trade["realized_pnl_usdt"] + payload.realized_pnl_usdt, trade_id),
+            (
+                trade["realized_pnl_usdt"] + payload.realized_pnl_usdt,
+                payload.size_value,
+                payload.notional_usdt,
+                payload.margin_usdt,
+                trade_id,
+            ),
         )
         apply_trade_pnl_delta(
             connection=connection,
@@ -700,7 +1036,16 @@ def delete_trade(trade_id: int) -> dict[str, object]:
     with closing(get_connection()) as connection:
         row = connection.execute(
             """
-            SELECT id, status
+            SELECT
+                id,
+                exchange_id,
+                status,
+                symbol,
+                side,
+                entry_price,
+                size_value,
+                size_unit,
+                realized_pnl_usdt
             FROM trades
             WHERE id = ?
             """,
@@ -708,6 +1053,15 @@ def delete_trade(trade_id: int) -> dict[str, object]:
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+        if row["status"] == "open" and abs(row["realized_pnl_usdt"]) > 0.00000001:
+            apply_trade_pnl_delta(
+                connection=connection,
+                exchange_id=row["exchange_id"],
+                pnl_delta=-row["realized_pnl_usdt"],
+                event_type="trade_delete",
+                note=f"Deleted open {row['symbol']} trade #{trade_id}",
+            )
 
         connection.execute(
             """
@@ -791,15 +1145,18 @@ def profit_calendar(year: int | None = None, month: int | None = None) -> dict[s
     start_date = date(target_year, target_month, 1)
     end_date = date(target_year, target_month, days_in_month)
 
-    rows = fetch_all(
-        """
-        SELECT profit_date, pnl_usdt, source
-        FROM daily_profit
-        WHERE profit_date BETWEEN ? AND ?
-        ORDER BY profit_date ASC
-        """,
-        (start_date.isoformat(), end_date.isoformat()),
-    )
+    with closing(get_connection()) as connection:
+        rebuild_daily_profit(connection)
+        connection.commit()
+        rows = connection.execute(
+            """
+            SELECT profit_date, pnl_usdt, source
+            FROM daily_profit
+            WHERE profit_date BETWEEN ? AND ?
+            ORDER BY profit_date ASC
+            """,
+            (start_date.isoformat(), end_date.isoformat()),
+        ).fetchall()
     by_date = {row["profit_date"]: row for row in rows}
     days = []
 

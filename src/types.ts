@@ -39,7 +39,7 @@ export type BalanceEvent = {
   exchangeId: number;
   exchangeSlug: string;
   exchangeName: string;
-  eventType: "seed" | "backfill" | "balance_update" | "pnl_reset" | "trade_close" | "trade_partial_close" | "trade_delete" | "transfer_in" | "transfer_out";
+  eventType: "seed" | "backfill" | "balance_update" | "pnl_reset" | "trade_close" | "trade_partial_close" | "trade_delete" | "funding" | "transfer_in" | "transfer_out";
   balanceBeforeUsdt: number | null;
   balanceAfterUsdt: number;
   startBalanceBeforeUsdt: number | null;
@@ -82,6 +82,9 @@ export type TradeClosePayload = {
 
 export type TradeRealizePnlPayload = {
   realized_pnl_usdt: number;
+  size_value?: number;
+  notional_usdt?: number;
+  margin_usdt?: number;
 };
 
 export type ExchangeTransferPayload = {
@@ -108,6 +111,7 @@ export type Trade = {
   leverage: number;
   marginMode: "isolated" | "cross";
   realizedPnlUsdt: number;
+  lastFundingAppliedAt: number | null;
   comment: string;
   openedAt: string;
   closedAt: string | null;
@@ -135,6 +139,34 @@ export type SituationCreatePayload = {
   token: string;
   description: string;
   posts: string;
+};
+
+export type SituationSettings = {
+  credentialsPath: string;
+  resolvedCredentialsPath: string;
+  credentialsExists: boolean;
+  serviceAccountEmail: string;
+  spreadsheetId: string;
+  sheetName: string;
+};
+
+export type SituationSettingsPayload = {
+  credentials_path: string;
+  spreadsheet_id: string;
+  sheet_name: string;
+};
+
+export type SituationSettingsCheck = {
+  key: string;
+  label: string;
+  ok: boolean;
+};
+
+export type SituationSettingsTestResponse = {
+  status: "ok" | "error";
+  settings: SituationSettings;
+  checks: SituationSettingsCheck[];
+  message?: string;
 };
 
 export type MarketSymbol = {

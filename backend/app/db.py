@@ -19,6 +19,7 @@ EXCHANGE_SEED = [
     ("kucoin", "Kucoin", 4900.0),
     ("hyperliquid", "HyperLiquid", 9200.0),
     ("aster", "Aster", 3100.0),
+    ("okx", "OKX", 5000.0),
 ]
 
 
@@ -82,6 +83,23 @@ def initialize_database() -> None:
                 deleted_at TEXT,
                 FOREIGN KEY (exchange_id) REFERENCES exchanges(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS funding_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                exchange_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                funding_time INTEGER NOT NULL,
+                funding_rate REAL NOT NULL,
+                notional_usdt REAL NOT NULL,
+                side TEXT NOT NULL,
+                amount_usdt REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'current_fallback',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_id, funding_time),
+                FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE,
+                FOREIGN KEY (exchange_id) REFERENCES exchanges(id) ON DELETE CASCADE
+            );
             """
         )
         _seed_exchanges(connection)
@@ -115,7 +133,7 @@ def _seed_exchanges(connection: sqlite3.Connection) -> None:
                 INSERT INTO exchanges (slug, name, balance_usdt, start_balance_usdt)
                 VALUES (?, ?, ?, ?)
                 """,
-                (slug, name, balance, balance * 0.94),
+                (slug, name, balance, balance),
             )
             exchange_id = connection.execute(
                 "SELECT id FROM exchanges WHERE slug = ?",
@@ -128,7 +146,7 @@ def _seed_exchanges(connection: sqlite3.Connection) -> None:
                 balance_before=None,
                 balance_after=balance,
                 start_balance_before=None,
-                start_balance_after=balance * 0.94,
+                start_balance_after=balance,
                 note="Initial exchange balance",
             )
 
@@ -200,6 +218,7 @@ def _migrate_trades_schema(connection: sqlite3.Connection) -> None:
         ("margin_mode", "ALTER TABLE trades ADD COLUMN margin_mode TEXT NOT NULL DEFAULT 'isolated'"),
         ("notional_usdt", "ALTER TABLE trades ADD COLUMN notional_usdt REAL NOT NULL DEFAULT 0"),
         ("comment", "ALTER TABLE trades ADD COLUMN comment TEXT NOT NULL DEFAULT ''"),
+        ("last_funding_applied_at", "ALTER TABLE trades ADD COLUMN last_funding_applied_at INTEGER"),
     ]
     for column_name, statement in migrations:
         if column_name not in columns:
@@ -225,15 +244,45 @@ def _rebuild_daily_profit_from_trade_events(connection: sqlite3.Connection) -> N
         """
         INSERT INTO daily_profit (profit_date, pnl_usdt, source)
         SELECT
-            date(created_at) AS profit_date,
-            ROUND(SUM(balance_after_usdt - COALESCE(balance_before_usdt, balance_after_usdt)), 8) AS pnl_usdt,
+            date(funding_events.created_at) AS profit_date,
+            ROUND(SUM(funding_events.amount_usdt), 8) AS pnl_usdt,
             'trades' AS source
-        FROM balance_events
-        WHERE event_type IN ('trade_close', 'trade_partial_close', 'trade_delete')
-        GROUP BY date(created_at)
+        FROM funding_events
+        JOIN trades ON trades.id = funding_events.trade_id
+        WHERE trades.status != 'deleted'
+        GROUP BY date(funding_events.created_at)
         HAVING ABS(pnl_usdt) > 0.00000001
+        ON CONFLICT(profit_date) DO UPDATE
+        SET pnl_usdt = pnl_usdt + excluded.pnl_usdt,
+            source = 'trades'
         """
     )
+    connection.execute(
+        """
+        INSERT INTO daily_profit (profit_date, pnl_usdt, source)
+        SELECT
+            date(trades.closed_at) AS profit_date,
+            ROUND(SUM(trades.realized_pnl_usdt - COALESCE(funding_totals.funding_pnl_usdt, 0)), 8) AS pnl_usdt,
+            'trades' AS source
+        FROM trades
+        LEFT JOIN (
+            SELECT trade_id, SUM(amount_usdt) AS funding_pnl_usdt
+            FROM funding_events
+            GROUP BY trade_id
+        ) AS funding_totals ON funding_totals.trade_id = trades.id
+        WHERE trades.status = 'closed'
+            AND trades.closed_at IS NOT NULL
+        GROUP BY date(trades.closed_at)
+        HAVING ABS(pnl_usdt) > 0.00000001
+        ON CONFLICT(profit_date) DO UPDATE
+        SET pnl_usdt = pnl_usdt + excluded.pnl_usdt,
+            source = 'trades'
+        """
+    )
+
+
+def rebuild_daily_profit(connection: sqlite3.Connection) -> None:
+    _rebuild_daily_profit_from_trade_events(connection)
 
 
 def fetch_all(query: str, parameters: tuple[Any, ...] = ()) -> list[sqlite3.Row]:

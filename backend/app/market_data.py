@@ -6,10 +6,9 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.error import URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
+import requests
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -24,6 +23,7 @@ SUPPORTED_MARKET_EXCHANGES = {
     "hyperliquid",
     "kucoin",
     "mexc",
+    "okx",
 }
 SYMBOL_CACHE_TTL_SECONDS = 600
 HTTP_TIMEOUT_SECONDS = 10
@@ -53,6 +53,8 @@ KUCOIN_REST_BASE = "https://api-futures.kucoin.com"
 KUCOIN_WS_URL = "wss://ws-api-futures.kucoin.com"
 MEXC_REST_BASE = "https://api.mexc.com"
 MEXC_WS_URL = "wss://contract.mexc.com/edge"
+OKX_REST_BASE = "https://www.okx.com"
+OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
 
 @dataclass
@@ -96,12 +98,25 @@ async def get_market_snapshot(exchange_slug: str, symbol: str) -> dict[str, obje
 
 
 async def get_market_funding(exchange_slug: str, symbol: str) -> dict[str, object]:
+    return await asyncio.to_thread(get_market_funding_sync, exchange_slug, symbol)
+
+
+def get_market_funding_sync(exchange_slug: str, symbol: str) -> dict[str, object]:
     normalized_exchange = normalize_exchange(exchange_slug)
     wire_symbol = resolve_wire_symbol(normalized_exchange, symbol)
     fetcher = FUNDING_FETCHERS.get(normalized_exchange)
     if not fetcher:
         raise ValueError(f"Funding is not connected for {normalized_exchange}")
-    return await asyncio.to_thread(fetcher, wire_symbol)
+    return fetcher(wire_symbol)
+
+
+def get_market_funding_history_sync(exchange_slug: str, symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    normalized_exchange = normalize_exchange(exchange_slug)
+    wire_symbol = resolve_wire_symbol(normalized_exchange, symbol)
+    fetcher = FUNDING_HISTORY_FETCHERS.get(normalized_exchange)
+    if not fetcher:
+        return []
+    return fetcher(wire_symbol, start_time_ms, end_time_ms)
 
 
 async def stream_market_data(websocket: WebSocket, exchange_slug: str, symbol: str) -> None:
@@ -198,25 +213,25 @@ def get_cached_symbols(exchange_slug: str) -> list[dict[str, object]]:
 
 
 def fetch_json(url: str) -> Any:
-    request = Request(url, headers={"User-Agent": "ProfitsNLosses/0.1"})
     try:
-        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except URLError as caught_error:
+        response = requests.get(url, headers={"User-Agent": "ProfitsNLosses/0.1"}, timeout=HTTP_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as caught_error:
         raise RuntimeError(f"Market data request failed: {caught_error}") from caught_error
 
 
 def post_json(url: str, payload: dict[str, object]) -> Any:
-    request = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "ProfitsNLosses/0.1"},
-        method="POST",
-    )
     try:
-        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except URLError as caught_error:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "ProfitsNLosses/0.1"},
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as caught_error:
         raise RuntimeError(f"Market data request failed: {caught_error}") from caught_error
 
 
@@ -373,10 +388,30 @@ def fetch_mexc_symbols() -> list[dict[str, object]]:
     return sorted(symbols, key=lambda item: str(item["symbol"]))
 
 
+def fetch_okx_symbols() -> list[dict[str, object]]:
+    payload = fetch_json(f"{OKX_REST_BASE}/api/v5/public/instruments?{urlencode({'instType': 'SWAP'})}")
+    symbols = []
+    for item in payload.get("data", []):
+        if item.get("state") != "live" or item.get("settleCcy") != "USDT":
+            continue
+        wire_symbol = str(item.get("instId") or "")
+        if not wire_symbol.endswith("-USDT-SWAP"):
+            continue
+        base_asset = wire_symbol.removesuffix("-USDT-SWAP")
+        symbols.append(make_symbol("okx", base_asset, wire_symbol, base_asset))
+    return sorted(symbols, key=lambda item: str(item["symbol"]))
+
+
 def resolve_wire_symbol(exchange_slug: str, symbol: str) -> str:
     normalized_symbol = symbol.strip().upper().replace("/", "").replace("-", "_")
     if exchange_slug in {"binance", "bybit", "aster", "bitget"}:
         return normalized_symbol.replace("_", "") if normalized_symbol.endswith("USDT") else f"{normalized_symbol}USDT"
+    if exchange_slug == "okx":
+        if normalized_symbol.endswith("_USDT_SWAP"):
+            return normalized_symbol.replace("_", "-")
+        if normalized_symbol.endswith("USDT"):
+            return f"{normalized_symbol.removesuffix('USDT')}-USDT-SWAP"
+        return f"{normalized_symbol}-USDT-SWAP"
     if exchange_slug in {"gate", "mexc"}:
         if normalized_symbol.endswith("_USDT"):
             return normalized_symbol
@@ -409,6 +444,8 @@ def to_display_symbol(exchange_slug: str, wire_symbol: str) -> str:
     if exchange_slug == "kucoin" and wire_symbol.endswith("USDTM"):
         base_asset = wire_symbol.removesuffix("USDTM")
         return "BTC" if base_asset == "XBT" else base_asset
+    if exchange_slug == "okx" and wire_symbol.endswith("-USDT-SWAP"):
+        return wire_symbol.removesuffix("-USDT-SWAP")
     return wire_symbol
 
 
@@ -419,7 +456,7 @@ def normalize_level(row: Any) -> dict[str, float]:
         return {"price": float(price), "size": float(size)}
     return {
         "price": float(row[0]),
-        "size": float(row[2] if len(row) > 2 else row[1]),
+        "size": float(row[1]),
     }
 
 
@@ -570,6 +607,22 @@ def fetch_mexc_snapshot(wire_symbol: str) -> dict[str, object]:
     )
 
 
+def fetch_okx_snapshot(wire_symbol: str) -> dict[str, object]:
+    depth = fetch_json(f"{OKX_REST_BASE}/api/v5/market/books?{urlencode({'instId': wire_symbol, 'sz': 20})}")
+    ticker = fetch_json(f"{OKX_REST_BASE}/api/v5/market/ticker?{urlencode({'instId': wire_symbol})}")
+    depth_data = first_item(depth.get("data", []))
+    ticker_data = first_item(ticker.get("data", []))
+    return build_snapshot(
+        exchange_slug="okx",
+        wire_symbol=wire_symbol,
+        last_price=float(ticker_data.get("last") or 0),
+        bids=normalize_levels(depth_data.get("bids") or depth_data.get("b") or []),
+        asks=normalize_levels(depth_data.get("asks") or depth_data.get("a") or []),
+        source="rest",
+        timestamp=depth_data.get("ts") or ticker_data.get("ts"),
+    )
+
+
 def parse_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -632,6 +685,138 @@ def fetch_bybit_funding(wire_symbol: str) -> dict[str, object]:
     payload = fetch_json(f"{BYBIT_REST_BASE}/v5/market/tickers?{urlencode({'category': 'linear', 'symbol': wire_symbol})}")
     ticker = first_item(payload.get("result", {}).get("list", []))
     return build_funding("bybit", wire_symbol, ticker.get("fundingRate"), ticker.get("nextFundingTime"))
+
+
+def fetch_binance_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    return fetch_binance_like_funding_history("binance", BINANCE_REST_BASE, wire_symbol, start_time_ms, end_time_ms)
+
+
+def fetch_aster_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    return fetch_binance_like_funding_history("aster", ASTER_REST_BASE, wire_symbol, start_time_ms, end_time_ms)
+
+
+def fetch_binance_like_funding_history(exchange_slug: str, rest_base: str, wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"symbol": wire_symbol, "startTime": start_time_ms, "endTime": end_time_ms, "limit": 1000})
+    payload = fetch_json(f"{rest_base}/fapi/v1/fundingRate?{params}")
+    rows = payload if isinstance(payload, list) else []
+    return normalize_funding_history(exchange_slug, wire_symbol, rows, ("fundingRate",), ("fundingTime",))
+
+
+def fetch_bybit_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"category": "linear", "symbol": wire_symbol, "startTime": start_time_ms, "endTime": end_time_ms, "limit": 200})
+    payload = fetch_json(f"{BYBIT_REST_BASE}/v5/market/funding/history?{params}")
+    rows = payload.get("result", {}).get("list", [])
+    return normalize_funding_history("bybit", wire_symbol, rows, ("fundingRate",), ("fundingRateTimestamp",))
+
+
+def fetch_bingx_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"symbol": wire_symbol, "startTime": start_time_ms, "endTime": end_time_ms, "limit": 1000})
+    payload = fetch_json(f"{BINGX_REST_BASE}/openApi/swap/v2/quote/fundingRate?{params}")
+    data = payload.get("data", [])
+    rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    return normalize_funding_history(
+        "bingx",
+        wire_symbol,
+        rows,
+        ("fundingRate", "lastFundingRate", "rate"),
+        ("fundingTime", "time", "settleTime"),
+    )
+
+
+def fetch_bitget_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"productType": "USDT-FUTURES", "symbol": wire_symbol, "startTime": start_time_ms, "endTime": end_time_ms, "pageSize": 100})
+    payload = fetch_json(f"{BITGET_REST_BASE}/api/v2/mix/market/history-fund-rate?{params}")
+    data = payload.get("data", [])
+    rows = data if isinstance(data, list) else []
+    return normalize_funding_history("bitget", wire_symbol, rows, ("fundingRate",), ("fundingTime", "time"))
+
+
+def fetch_gate_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"contract": wire_symbol, "from": start_time_ms // 1000, "to": end_time_ms // 1000, "limit": 100})
+    payload = fetch_json(f"{GATE_REST_BASE}/futures/usdt/funding_rate?{params}")
+    rows = payload if isinstance(payload, list) else []
+    return normalize_funding_history("gate", wire_symbol, rows, ("r", "rate", "funding_rate"), ("t", "time", "funding_time"))
+
+
+def fetch_hyperliquid_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    payload = post_json(
+        HYPERLIQUID_REST_URL,
+        {"type": "fundingHistory", "coin": wire_symbol, "startTime": start_time_ms, "endTime": end_time_ms},
+    )
+    rows = payload if isinstance(payload, list) else []
+    return normalize_funding_history("hyperliquid", wire_symbol, rows, ("fundingRate", "rate"), ("time", "fundingTime"))
+
+
+def fetch_kucoin_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"symbol": wire_symbol, "from": start_time_ms, "to": end_time_ms})
+    payload = fetch_json(f"{KUCOIN_REST_BASE}/api/v1/contract/funding-rates?{params}")
+    data = payload.get("data", [])
+    rows = data if isinstance(data, list) else []
+    return normalize_funding_history(
+        "kucoin",
+        wire_symbol,
+        rows,
+        ("fundingRate", "fundingFeeRate", "value"),
+        ("timepoint", "timePoint", "fundingTime", "time"),
+    )
+
+
+def fetch_mexc_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"symbol": wire_symbol, "page_num": 1, "page_size": 100, "start_time": start_time_ms, "end_time": end_time_ms})
+    payload = fetch_json(f"{MEXC_REST_BASE}/api/v1/contract/funding_rate/history?{params}")
+    data = payload.get("data", [])
+    if isinstance(data, dict):
+        rows = data.get("resultList") or data.get("records") or data.get("list") or []
+    else:
+        rows = data
+    return normalize_funding_history(
+        "mexc",
+        wire_symbol,
+        rows if isinstance(rows, list) else [],
+        ("fundingRate", "rate"),
+        ("settleTime", "fundingTime", "time"),
+    )
+
+
+def fetch_okx_funding_history(wire_symbol: str, start_time_ms: int, end_time_ms: int) -> list[dict[str, object]]:
+    params = urlencode({"instId": wire_symbol, "before": end_time_ms, "after": start_time_ms, "limit": 100})
+    payload = fetch_json(f"{OKX_REST_BASE}/api/v5/public/funding-rate-history?{params}")
+    rows = payload.get("data", [])
+    return normalize_funding_history("okx", wire_symbol, rows, ("fundingRate",), ("fundingTime",))
+
+
+def funding_history_value(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def normalize_funding_history(
+    exchange_slug: str,
+    wire_symbol: str,
+    rows: list[Any],
+    rate_key: tuple[str, ...],
+    time_key: tuple[str, ...],
+) -> list[dict[str, object]]:
+    history = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        funding_time = parse_timestamp_ms(funding_history_value(row, time_key))
+        if not funding_time:
+            continue
+        history.append(
+            {
+                "exchangeSlug": exchange_slug,
+                "symbol": to_display_symbol(exchange_slug, wire_symbol),
+                "wireSymbol": wire_symbol,
+                "fundingRate": parse_float(funding_history_value(row, rate_key)),
+                "fundingTime": funding_time,
+            }
+        )
+    return sorted(history, key=lambda item: int(item["fundingTime"]))
 
 
 def fetch_bingx_funding(wire_symbol: str) -> dict[str, object]:
@@ -701,6 +886,12 @@ def fetch_mexc_funding(wire_symbol: str) -> dict[str, object]:
         if isinstance(funding_data, dict):
             data = {**funding_data, **data}
     return build_funding("mexc", wire_symbol, data.get("fundingRate"), data.get("nextSettleTime") or data.get("nextFundingTime"))
+
+
+def fetch_okx_funding(wire_symbol: str) -> dict[str, object]:
+    payload = fetch_json(f"{OKX_REST_BASE}/api/v5/public/funding-rate?{urlencode({'instId': wire_symbol})}")
+    data = first_item(payload.get("data", []))
+    return build_funding("okx", wire_symbol, data.get("fundingRate"), data.get("nextFundingTime"))
 
 
 def first_item(rows: list[Any]) -> dict[str, Any]:
@@ -961,6 +1152,49 @@ async def stream_mexc(websocket: WebSocket, wire_symbol: str, snapshot: dict[str
             await send_book(websocket, "mexc", wire_symbol, last_price, bids, asks, payload.get("ts"))
 
 
+async def stream_okx(websocket: WebSocket, wire_symbol: str, snapshot: dict[str, object]) -> None:
+    last_price = float(snapshot["lastPrice"])
+    bids = {row["price"]: row["size"] for row in snapshot["bids"]}
+    asks = {row["price"]: row["size"] for row in snapshot["asks"]}
+    await send_status(websocket, "okx", wire_symbol)
+
+    try:
+        fresh_snapshot = await asyncio.to_thread(fetch_okx_snapshot, wire_symbol)
+        bids = {row["price"]: row["size"] for row in fresh_snapshot["bids"]}
+        asks = {row["price"]: row["size"] for row in fresh_snapshot["asks"]}
+        last_price = float(fresh_snapshot["lastPrice"] or last_price)
+        await send_book(websocket, "okx", wire_symbol, last_price, bids, asks, int(time.time() * 1000))
+    except Exception:
+        pass
+
+    async with websockets.connect(OKX_WS_URL, ping_interval=20, ping_timeout=20, open_timeout=5) as upstream:
+        await upstream.send(
+            json.dumps(
+                {
+                    "op": "subscribe",
+                    "args": [
+                        {"channel": "books5", "instId": wire_symbol},
+                        {"channel": "tickers", "instId": wire_symbol},
+                    ],
+                }
+            )
+        )
+        async for raw_message in upstream:
+            payload = json.loads(raw_message)
+            if payload.get("event"):
+                continue
+            data = first_item(payload.get("data", []))
+            channel = payload.get("arg", {}).get("channel")
+            if channel == "books5":
+                bids = {row["price"]: row["size"] for row in normalize_levels(data.get("bids") or data.get("b") or [])}
+                asks = {row["price"]: row["size"] for row in normalize_levels(data.get("asks") or data.get("a") or [])}
+                await send_book(websocket, "okx", wire_symbol, last_price, bids, asks, data.get("ts"))
+            elif channel == "tickers":
+                last_price = float(data.get("last") or last_price)
+                if bids or asks:
+                    await send_book(websocket, "okx", wire_symbol, last_price, bids, asks, data.get("ts"))
+
+
 def apply_levels(book: dict[float, float], updates: list[dict[str, float]]) -> None:
     for level in updates:
         if level["size"] <= 0:
@@ -1004,6 +1238,7 @@ SYMBOL_FETCHERS: dict[str, Callable[[], list[dict[str, object]]]] = {
     "hyperliquid": fetch_hyperliquid_symbols,
     "kucoin": fetch_kucoin_symbols,
     "mexc": fetch_mexc_symbols,
+    "okx": fetch_okx_symbols,
 }
 
 SNAPSHOT_FETCHERS: dict[str, Callable[[str], dict[str, object]]] = {
@@ -1016,6 +1251,7 @@ SNAPSHOT_FETCHERS: dict[str, Callable[[str], dict[str, object]]] = {
     "hyperliquid": fetch_hyperliquid_snapshot,
     "kucoin": fetch_kucoin_snapshot,
     "mexc": fetch_mexc_snapshot,
+    "okx": fetch_okx_snapshot,
 }
 
 FUNDING_FETCHERS: dict[str, Callable[[str], dict[str, object]]] = {
@@ -1028,6 +1264,20 @@ FUNDING_FETCHERS: dict[str, Callable[[str], dict[str, object]]] = {
     "hyperliquid": fetch_hyperliquid_funding,
     "kucoin": fetch_kucoin_funding,
     "mexc": fetch_mexc_funding,
+    "okx": fetch_okx_funding,
+}
+
+FUNDING_HISTORY_FETCHERS: dict[str, Callable[[str, int, int], list[dict[str, object]]]] = {
+    "aster": fetch_aster_funding_history,
+    "binance": fetch_binance_funding_history,
+    "bingx": fetch_bingx_funding_history,
+    "bitget": fetch_bitget_funding_history,
+    "bybit": fetch_bybit_funding_history,
+    "gate": fetch_gate_funding_history,
+    "hyperliquid": fetch_hyperliquid_funding_history,
+    "kucoin": fetch_kucoin_funding_history,
+    "mexc": fetch_mexc_funding_history,
+    "okx": fetch_okx_funding_history,
 }
 
 STREAM_CALLBACKS = {
@@ -1040,4 +1290,5 @@ STREAM_CALLBACKS = {
     "hyperliquid": stream_hyperliquid,
     "kucoin": stream_kucoin,
     "mexc": stream_mexc,
+    "okx": stream_okx,
 }
