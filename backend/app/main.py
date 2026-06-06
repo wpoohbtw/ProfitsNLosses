@@ -6,12 +6,13 @@ from datetime import date, datetime
 import time
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .db import fetch_all, get_connection, initialize_database, rebuild_daily_profit
+from .db import ensure_user_exchanges, fetch_all, get_connection, initialize_database, rebuild_daily_profit
 from .market_data import get_market_funding, get_market_funding_history_sync, get_market_funding_sync, get_market_snapshot, get_market_symbols, stream_market_data
+from .portal_identity import get_current_portal_user, get_default_portal_user_id
 from .situations import (
     SituationsConfigError,
     append_situation,
@@ -91,6 +92,10 @@ class SituationSettingsUpdate(BaseModel):
     sheet_name: str = Field(default="Situations", min_length=1, max_length=80)
 
 
+def portal_user_id(current_user: dict[str, object]) -> int:
+    return int(current_user["userId"])
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     initialize_database()
@@ -99,6 +104,14 @@ def on_startup() -> None:
 @app.get("/api/v1/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/v1/me")
+def get_me(current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    return {
+        "userId": portal_user_id(current_user),
+        "username": current_user.get("username", ""),
+    }
 
 
 @app.get("/api/v1/situations/settings")
@@ -211,26 +224,32 @@ async def market_ws(websocket: WebSocket, exchange_slug: str, symbol: str) -> No
 
 
 @app.get("/api/v1/exchanges")
-def list_exchanges() -> dict[str, object]:
-    rows = fetch_all(
-        """
-        SELECT id, slug, name, balance_usdt, start_balance_usdt, pnl_reset_at, updated_at
-        FROM exchanges
-        ORDER BY CASE slug
-            WHEN 'binance' THEN 1
-            WHEN 'bybit' THEN 2
-            WHEN 'mexc' THEN 3
-            WHEN 'bingx' THEN 4
-            WHEN 'gate' THEN 5
-            WHEN 'bitget' THEN 6
-            WHEN 'kucoin' THEN 7
-            WHEN 'hyperliquid' THEN 8
-            WHEN 'aster' THEN 9
-            WHEN 'okx' THEN 10
-            ELSE 99
-        END
-        """
-    )
+def list_exchanges(current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
+    with closing(get_connection()) as connection:
+        ensure_user_exchanges(connection, user_id)
+        rows = connection.execute(
+            """
+            SELECT id, slug, name, balance_usdt, start_balance_usdt, pnl_reset_at, updated_at
+            FROM exchanges
+            WHERE user_id = ?
+            ORDER BY CASE slug
+                WHEN 'binance' THEN 1
+                WHEN 'bybit' THEN 2
+                WHEN 'mexc' THEN 3
+                WHEN 'bingx' THEN 4
+                WHEN 'gate' THEN 5
+                WHEN 'bitget' THEN 6
+                WHEN 'kucoin' THEN 7
+                WHEN 'hyperliquid' THEN 8
+                WHEN 'aster' THEN 9
+                WHEN 'okx' THEN 10
+                ELSE 99
+            END
+            """,
+            (user_id,),
+        ).fetchall()
+        connection.commit()
     return build_exchanges_response(rows)
 
 
@@ -266,14 +285,23 @@ def build_exchanges_response(rows: list[object]) -> dict[str, object]:
     }
 
 
-def fetch_exchange_or_404(connection, exchange_id: int):
+def fetch_exchange_or_404(connection, exchange_id: int, user_id: int | None = None):
+    parameters: tuple[object, ...]
+    user_clause = ""
+    if user_id is not None:
+        user_clause = "AND user_id = ?"
+        parameters = (exchange_id, user_id)
+    else:
+        parameters = (exchange_id,)
+
     row = connection.execute(
-        """
-        SELECT id, balance_usdt, start_balance_usdt
+        f"""
+        SELECT id, user_id, balance_usdt, start_balance_usdt
         FROM exchanges
         WHERE id = ?
+        {user_clause}
         """,
-        (exchange_id,),
+        parameters,
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Биржа не найдена")
@@ -290,11 +318,18 @@ def insert_balance_event(
     start_balance_after: float,
     note: str | None = None,
     created_at: str | None = None,
+    user_id: int | None = None,
 ) -> None:
+    resolved_user_id = user_id
+    if resolved_user_id is None:
+        row = connection.execute("SELECT user_id FROM exchanges WHERE id = ?", (exchange_id,)).fetchone()
+        resolved_user_id = row["user_id"] if row else get_default_portal_user_id()
+
     connection.execute(
         """
         INSERT INTO balance_events (
             exchange_id,
+            user_id,
             event_type,
             balance_before_usdt,
             balance_after_usdt,
@@ -304,10 +339,11 @@ def insert_balance_event(
             note,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
         """,
         (
             exchange_id,
+            resolved_user_id,
             event_type,
             balance_before,
             balance_after,
@@ -320,16 +356,17 @@ def insert_balance_event(
     )
 
 
-def add_daily_profit_delta(connection, pnl_delta: float, profit_date: str | None = None) -> None:
+def add_daily_profit_delta(connection, pnl_delta: float, profit_date: str | None = None, user_id: int | None = None) -> None:
+    resolved_user_id = user_id or get_default_portal_user_id()
     connection.execute(
         """
-        INSERT INTO daily_profit (profit_date, pnl_usdt, source)
-        VALUES (?, ?, 'trades')
-        ON CONFLICT(profit_date) DO UPDATE
+        INSERT INTO daily_profit (user_id, profit_date, pnl_usdt, source)
+        VALUES (?, ?, ?, 'trades')
+        ON CONFLICT(user_id, profit_date) DO UPDATE
         SET pnl_usdt = pnl_usdt + excluded.pnl_usdt,
             source = 'trades'
         """,
-        (profit_date or date.today().isoformat(), pnl_delta),
+        (resolved_user_id, profit_date or date.today().isoformat(), pnl_delta),
     )
 
 
@@ -363,8 +400,9 @@ def apply_trade_pnl_delta(
         start_balance_after=exchange["start_balance_usdt"],
         note=note,
         created_at=created_at,
+        user_id=exchange["user_id"],
     )
-    add_daily_profit_delta(connection, pnl_delta, profit_date)
+    add_daily_profit_delta(connection, pnl_delta, profit_date, exchange["user_id"])
 
 
 def calculate_trade_price_pnl(side: str, entry_price: float, exit_price: float, size_value: float, size_unit: str) -> float:
@@ -478,6 +516,7 @@ def apply_funding_event(
         INSERT INTO funding_events (
             trade_id,
             exchange_id,
+            user_id,
             symbol,
             funding_time,
             funding_rate,
@@ -487,11 +526,12 @@ def apply_funding_event(
             source,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trade["id"],
             trade["exchange_id"],
+            trade["user_id"],
             trade["symbol"],
             funding_time,
             funding_rate,
@@ -571,12 +611,13 @@ def sync_funding_for_trade(connection, trade, end_ms: int, prefer_history: bool 
         apply_funding_event(connection, trade, funding_time, funding_rate, "current_fallback")
 
 
-def sync_funding_for_trades(connection, status: str = "open") -> None:
+def sync_funding_for_trades(connection, user_id: int, status: str = "open") -> None:
     trades = connection.execute(
         """
         SELECT
             trades.id,
             trades.exchange_id,
+            trades.user_id,
             exchanges.slug AS exchange_slug,
             trades.symbol,
             trades.side,
@@ -587,9 +628,10 @@ def sync_funding_for_trades(connection, status: str = "open") -> None:
             trades.last_funding_applied_at
         FROM trades
         JOIN exchanges ON exchanges.id = trades.exchange_id
-        WHERE trades.status = ?
+        WHERE trades.user_id = ?
+            AND trades.status = ?
         """,
-        (status,),
+        (user_id, status),
     ).fetchall()
     now_ms = int(time.time() * 1000)
 
@@ -598,28 +640,30 @@ def sync_funding_for_trades(connection, status: str = "open") -> None:
         sync_funding_for_trade(connection, trade, end_ms=end_ms, prefer_history=True)
 
 
-def sync_funding_for_open_trades(connection) -> None:
-    sync_funding_for_trades(connection, status="open")
+def sync_funding_for_open_trades(connection, user_id: int) -> None:
+    sync_funding_for_trades(connection, user_id=user_id, status="open")
 
 
-def sync_funding_for_closed_trades(connection) -> None:
-    sync_funding_for_trades(connection, status="closed")
+def sync_funding_for_closed_trades(connection, user_id: int) -> None:
+    sync_funding_for_trades(connection, user_id=user_id, status="closed")
 
 
 @app.post("/api/v1/funding/reconcile")
-def reconcile_funding() -> dict[str, str]:
+def reconcile_funding(current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, str]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        sync_funding_for_open_trades(connection)
-        sync_funding_for_closed_trades(connection)
-        rebuild_daily_profit(connection)
+        sync_funding_for_open_trades(connection, user_id)
+        sync_funding_for_closed_trades(connection, user_id)
+        rebuild_daily_profit(connection, user_id)
         connection.commit()
     return {"status": "reconciled"}
 
 
 @app.put("/api/v1/exchanges/{exchange_id}/balance")
-def update_balance(exchange_id: int, payload: BalanceUpdate) -> dict[str, object]:
+def update_balance(exchange_id: int, payload: BalanceUpdate, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        row = fetch_exchange_or_404(connection, exchange_id)
+        row = fetch_exchange_or_404(connection, exchange_id, user_id)
         old_balance = row["balance_usdt"]
         start_balance = row["start_balance_usdt"]
 
@@ -647,9 +691,10 @@ def update_balance(exchange_id: int, payload: BalanceUpdate) -> dict[str, object
 
 
 @app.post("/api/v1/exchanges/{exchange_id}/reset-pnl")
-def reset_exchange_pnl(exchange_id: int) -> dict[str, object]:
+def reset_exchange_pnl(exchange_id: int, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        row = fetch_exchange_or_404(connection, exchange_id)
+        row = fetch_exchange_or_404(connection, exchange_id, user_id)
         current_balance = row["balance_usdt"]
         old_start_balance = row["start_balance_usdt"]
 
@@ -677,13 +722,14 @@ def reset_exchange_pnl(exchange_id: int) -> dict[str, object]:
 
 
 @app.post("/api/v1/exchanges/transfer")
-def transfer_between_exchanges(payload: ExchangeTransfer) -> dict[str, object]:
+def transfer_between_exchanges(payload: ExchangeTransfer, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
     if payload.from_exchange_id == payload.to_exchange_id:
         raise HTTPException(status_code=400, detail="Выберите разные биржи")
 
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        from_exchange = fetch_exchange_or_404(connection, payload.from_exchange_id)
-        to_exchange = fetch_exchange_or_404(connection, payload.to_exchange_id)
+        from_exchange = fetch_exchange_or_404(connection, payload.from_exchange_id, user_id)
+        to_exchange = fetch_exchange_or_404(connection, payload.to_exchange_id, user_id)
         if payload.amount_usdt > from_exchange["balance_usdt"]:
             raise HTTPException(status_code=400, detail="Недостаточно баланса на бирже-источнике")
 
@@ -734,9 +780,10 @@ def transfer_between_exchanges(payload: ExchangeTransfer) -> dict[str, object]:
 
 
 @app.post("/api/v1/trades")
-def create_trade(payload: TradeCreate) -> dict[str, object]:
+def create_trade(payload: TradeCreate, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        exchange = fetch_exchange_or_404(connection, payload.exchange_id)
+        exchange = fetch_exchange_or_404(connection, payload.exchange_id, user_id)
         if payload.margin_usdt > exchange["balance_usdt"]:
             raise HTTPException(status_code=400, detail="Недостаточно баланса на бирже")
 
@@ -744,6 +791,7 @@ def create_trade(payload: TradeCreate) -> dict[str, object]:
             """
             INSERT INTO trades (
                 exchange_id,
+                user_id,
                 group_id,
                 symbol,
                 side,
@@ -756,10 +804,11 @@ def create_trade(payload: TradeCreate) -> dict[str, object]:
                 margin_mode,
                 last_funding_applied_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.exchange_id,
+                user_id,
                 payload.group_id,
                 payload.symbol.upper(),
                 payload.side,
@@ -779,22 +828,23 @@ def create_trade(payload: TradeCreate) -> dict[str, object]:
 
 
 @app.get("/api/v1/trades")
-def list_trades(status: str | None = "open") -> dict[str, object]:
-    parameters: list[object] = []
-    where_clause = ""
+def list_trades(status: str | None = "open", current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
+    parameters: list[object] = [user_id]
+    where_clause = "WHERE trades.user_id = ?"
     if status is not None:
         if status not in {"open", "closed", "deleted"}:
             raise HTTPException(status_code=400, detail="Некорректный статус сделки")
-        where_clause = "WHERE trades.status = ?"
+        where_clause += " AND trades.status = ?"
         parameters.append(status)
 
     if status == "open":
         with closing(get_connection()) as connection:
-            sync_funding_for_open_trades(connection)
+            sync_funding_for_open_trades(connection, user_id)
             connection.commit()
     elif status == "closed":
         with closing(get_connection()) as connection:
-            sync_funding_for_closed_trades(connection)
+            sync_funding_for_closed_trades(connection, user_id)
             connection.commit()
 
     rows = fetch_all(
@@ -861,15 +911,16 @@ def list_trades(status: str | None = "open") -> dict[str, object]:
 
 
 @app.put("/api/v1/trade-groups/{group_id}/comment")
-def update_trade_group_comment(group_id: str, payload: TradeGroupComment) -> dict[str, object]:
+def update_trade_group_comment(group_id: str, payload: TradeGroupComment, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
         cursor = connection.execute(
             """
             UPDATE trades
             SET comment = ?
-            WHERE group_id = ?
+            WHERE user_id = ? AND group_id = ?
             """,
-            (payload.comment, group_id),
+            (payload.comment, user_id, group_id),
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Группа сделок не найдена")
@@ -879,9 +930,10 @@ def update_trade_group_comment(group_id: str, payload: TradeGroupComment) -> dic
 
 
 @app.post("/api/v1/trades/{trade_id}/close")
-def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
+def close_trade(trade_id: int, payload: TradeClose, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        sync_funding_for_open_trades(connection)
+        sync_funding_for_open_trades(connection, user_id)
         trade = connection.execute(
             """
             SELECT
@@ -895,9 +947,9 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
                 size_unit,
                 realized_pnl_usdt
             FROM trades
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         ).fetchone()
         if trade is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
@@ -924,7 +976,7 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
                 leverage = COALESCE(?, leverage),
                 margin_mode = COALESCE(?, margin_mode),
                 closed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
             (
                 payload.exit_price,
@@ -934,6 +986,7 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
                 payload.leverage,
                 payload.margin_mode,
                 trade_id,
+                user_id,
             ),
         )
         apply_trade_pnl_delta(
@@ -949,16 +1002,17 @@ def close_trade(trade_id: int, payload: TradeClose) -> dict[str, object]:
 
 
 @app.post("/api/v1/trades/{trade_id}/realize-pnl")
-def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, object]:
+def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
-        sync_funding_for_open_trades(connection)
+        sync_funding_for_open_trades(connection, user_id)
         trade = connection.execute(
             """
             SELECT id, exchange_id, status, symbol, realized_pnl_usdt
             FROM trades
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         ).fetchone()
         if trade is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
@@ -972,7 +1026,7 @@ def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, obje
                 size_value = COALESCE(?, size_value),
                 notional_usdt = COALESCE(?, notional_usdt),
                 margin_usdt = COALESCE(?, margin_usdt)
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
             (
                 trade["realized_pnl_usdt"] + payload.realized_pnl_usdt,
@@ -980,6 +1034,7 @@ def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, obje
                 payload.notional_usdt,
                 payload.margin_usdt,
                 trade_id,
+                user_id,
             ),
         )
         apply_trade_pnl_delta(
@@ -995,15 +1050,16 @@ def realize_trade_pnl(trade_id: int, payload: TradeRealizePnl) -> dict[str, obje
 
 
 @app.post("/api/v1/trades/{trade_id}/revert-close")
-def revert_closed_trade(trade_id: int) -> dict[str, object]:
+def revert_closed_trade(trade_id: int, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
         trade = connection.execute(
             """
             SELECT id, exchange_id, status, symbol, realized_pnl_usdt
             FROM trades
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         ).fetchone()
         if trade is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
@@ -1022,9 +1078,9 @@ def revert_closed_trade(trade_id: int) -> dict[str, object]:
             UPDATE trades
             SET status = 'deleted',
                 deleted_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         )
         connection.commit()
 
@@ -1032,7 +1088,8 @@ def revert_closed_trade(trade_id: int) -> dict[str, object]:
 
 
 @app.delete("/api/v1/trades/{trade_id}")
-def delete_trade(trade_id: int) -> dict[str, object]:
+def delete_trade(trade_id: int, current_user: dict[str, object] = Depends(get_current_portal_user)) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     with closing(get_connection()) as connection:
         row = connection.execute(
             """
@@ -1047,9 +1104,9 @@ def delete_trade(trade_id: int) -> dict[str, object]:
                 size_unit,
                 realized_pnl_usdt
             FROM trades
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
@@ -1067,9 +1124,9 @@ def delete_trade(trade_id: int) -> dict[str, object]:
             """
             UPDATE trades
             SET status = 'deleted', deleted_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (trade_id,),
+            (trade_id, user_id),
         )
         connection.commit()
 
@@ -1080,11 +1137,13 @@ def delete_trade(trade_id: int) -> dict[str, object]:
 def list_balance_events(
     exchange_id: int | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    current_user: dict[str, object] = Depends(get_current_portal_user),
 ) -> dict[str, object]:
-    parameters: list[object] = []
-    where_clause = ""
+    user_id = portal_user_id(current_user)
+    parameters: list[object] = [user_id]
+    where_clause = "WHERE balance_events.user_id = ?"
     if exchange_id is not None:
-        where_clause = "WHERE balance_events.exchange_id = ?"
+        where_clause += " AND balance_events.exchange_id = ?"
         parameters.append(exchange_id)
     parameters.append(limit)
 
@@ -1133,7 +1192,12 @@ def list_balance_events(
 
 
 @app.get("/api/v1/profit-calendar")
-def profit_calendar(year: int | None = None, month: int | None = None) -> dict[str, object]:
+def profit_calendar(
+    year: int | None = None,
+    month: int | None = None,
+    current_user: dict[str, object] = Depends(get_current_portal_user),
+) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
     today = date.today()
     target_year = year or today.year
     target_month = month or today.month
@@ -1146,16 +1210,16 @@ def profit_calendar(year: int | None = None, month: int | None = None) -> dict[s
     end_date = date(target_year, target_month, days_in_month)
 
     with closing(get_connection()) as connection:
-        rebuild_daily_profit(connection)
+        rebuild_daily_profit(connection, user_id)
         connection.commit()
         rows = connection.execute(
             """
             SELECT profit_date, pnl_usdt, source
             FROM daily_profit
-            WHERE profit_date BETWEEN ? AND ?
+            WHERE user_id = ? AND profit_date BETWEEN ? AND ?
             ORDER BY profit_date ASC
             """,
-            (start_date.isoformat(), end_date.isoformat()),
+            (user_id, start_date.isoformat(), end_date.isoformat()),
         ).fetchall()
     by_date = {row["profit_date"]: row for row in rows}
     days = []

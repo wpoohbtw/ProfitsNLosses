@@ -20,6 +20,11 @@ export type ExchangesResponse = {
   summary: ExchangeSummary;
 };
 
+export type CurrentUser = {
+  userId: number;
+  username: string;
+};
+
 export type CalendarDay = {
   date: string;
   day: number;

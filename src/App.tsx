@@ -31,6 +31,7 @@ import {
   deleteSituation,
   deleteTrade,
   getExchanges,
+  getCurrentUser,
   getMarketFunding,
   getMarketSymbols,
   getMarketWsUrl,
@@ -50,6 +51,7 @@ import {
 } from "./api";
 import type {
   CalendarDay,
+  CurrentUser,
   Exchange,
   ExchangeSummary,
   FundingInfo,
@@ -292,7 +294,8 @@ function getMonthName(calendar: ProfitCalendarResponse | null): string {
 }
 
 function getExchangeIconPath(slug: string): string {
-  return `/exchange-icons/${slug}.svg`;
+  const basePath = import.meta.env.BASE_URL.endsWith("/") ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+  return `${basePath}exchange-icons/${slug}.svg`;
 }
 
 function sortExchanges(exchanges: Exchange[]): Exchange[] {
@@ -334,15 +337,33 @@ function createTicket(id: number): TradeTicket {
   };
 }
 
-function getInitialPage(): PageId {
-  const savedPage = window.localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY);
+function getUserStorageKey(key: string, user: CurrentUser): string {
+  const username = user.username || "user";
+  return `${key}:${user.userId}:${username}`;
+}
+
+function getStoredValue(key: string, user: CurrentUser | null): string | null {
+  if (!user) {
+    return window.localStorage.getItem(key);
+  }
+
+  const scopedValue = window.localStorage.getItem(getUserStorageKey(key, user));
+  if (scopedValue !== null) {
+    return scopedValue;
+  }
+
+  return user.username === "wpoohbtw" ? window.localStorage.getItem(key) : null;
+}
+
+function getInitialPage(user: CurrentUser | null = null): PageId {
+  const savedPage = getStoredValue(ACTIVE_PAGE_STORAGE_KEY, user);
   return savedPage === "exchanges" || savedPage === "trades" || savedPage === "deals" || savedPage === "situations"
     ? savedPage
     : "exchanges";
 }
 
-function getInitialTickets(): TradeTicket[] {
-  const storedTickets = window.localStorage.getItem(TRADE_TICKETS_STORAGE_KEY);
+function getInitialTickets(user: CurrentUser | null = null): TradeTicket[] {
+  const storedTickets = getStoredValue(TRADE_TICKETS_STORAGE_KEY, user);
   if (!storedTickets) {
     return [];
   }
@@ -364,8 +385,8 @@ function getInitialTickets(): TradeTicket[] {
   }
 }
 
-function getInitialOpenPositions(): OpenPosition[] {
-  const storedPositions = window.localStorage.getItem(OPEN_POSITIONS_STORAGE_KEY);
+function getInitialOpenPositions(user: CurrentUser | null = null): OpenPosition[] {
+  const storedPositions = getStoredValue(OPEN_POSITIONS_STORAGE_KEY, user);
   if (!storedPositions) {
     return [];
   }
@@ -713,6 +734,7 @@ function getPositionLiquidationPrice(position: OpenPosition, positions: OpenPosi
 function App() {
   const today = new Date();
   const [activePage, setActivePage] = useState<PageId>(getInitialPage);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [summary, setSummary] = useState<ExchangeSummary>(emptySummary);
   const [calendar, setCalendar] = useState<ProfitCalendarResponse | null>(null);
@@ -768,7 +790,8 @@ function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const [exchangePayload, calendarPayload, openTradesPayload, closedTradesPayload] = await Promise.all([
+      const [userPayload, exchangePayload, calendarPayload, openTradesPayload, closedTradesPayload] = await Promise.all([
+        getCurrentUser(),
         getExchanges(),
         getProfitCalendar(targetMonth.year, targetMonth.month),
         getTrades("open"),
@@ -776,13 +799,17 @@ function App() {
       ]);
       const sortedExchanges = sortExchanges(exchangePayload.exchanges);
       const backendOpenPositions = openTradesPayload.trades.map(tradeToOpenPosition).filter((position): position is OpenPosition => position !== null);
+      const restoredTickets = getInitialTickets(userPayload).map((ticket) => normalizeTicketExchange(ticket, sortedExchanges));
+      setCurrentUser(userPayload);
+      setActivePage(getInitialPage(userPayload));
       setExchanges(sortedExchanges);
       setSummary(exchangePayload.summary);
       setCalendar(calendarPayload);
       setOpenPositions(backendOpenPositions);
       setNextPositionId(getNextPositionId(backendOpenPositions));
       setClosedPositions(closedTradesPayload.trades.map(tradeToClosedPosition).filter((position): position is ClosedPosition => position !== null));
-      setTickets((current) => current.map((ticket) => normalizeTicketExchange(ticket, sortedExchanges)));
+      setTickets(restoredTickets);
+      setNextTicketId(getNextTicketId(restoredTickets));
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Не удалось загрузить данные");
     } finally {
@@ -877,8 +904,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, activePage);
-  }, [activePage]);
+    if (!currentUser) {
+      return;
+    }
+    window.localStorage.setItem(getUserStorageKey(ACTIVE_PAGE_STORAGE_KEY, currentUser), activePage);
+  }, [activePage, currentUser]);
 
   useEffect(() => {
     if (activePage === "situations") {
@@ -892,12 +922,18 @@ function App() {
   }, [activePage]);
 
   useEffect(() => {
-    window.localStorage.setItem(TRADE_TICKETS_STORAGE_KEY, JSON.stringify(tickets));
-  }, [tickets]);
+    if (!currentUser) {
+      return;
+    }
+    window.localStorage.setItem(getUserStorageKey(TRADE_TICKETS_STORAGE_KEY, currentUser), JSON.stringify(tickets));
+  }, [tickets, currentUser]);
 
   useEffect(() => {
-    window.localStorage.setItem(OPEN_POSITIONS_STORAGE_KEY, JSON.stringify(openPositions));
-  }, [openPositions]);
+    if (!currentUser) {
+      return;
+    }
+    window.localStorage.setItem(getUserStorageKey(OPEN_POSITIONS_STORAGE_KEY, currentUser), JSON.stringify(openPositions));
+  }, [openPositions, currentUser]);
 
   function normalizeTicketExchange(ticket: TradeTicket, nextExchanges: Exchange[]): TradeTicket {
     if (ticket.exchangeId === "") {

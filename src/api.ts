@@ -1,5 +1,6 @@
 import type {
   BalanceEventsResponse,
+  CurrentUser,
   FundingInfo,
   ExchangesResponse,
   MarketSnapshot,
@@ -17,7 +18,8 @@ import type {
   TradesResponse
 } from "./types";
 
-const API_PREFIX = "/api/v1";
+const appBase = import.meta.env.BASE_URL.endsWith("/") ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const API_PREFIX = `${appBase}api/v1`;
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_PREFIX}${path}`, {
@@ -48,6 +50,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export function getExchanges(): Promise<ExchangesResponse> {
   return request<ExchangesResponse>("/exchanges");
+}
+
+export function getCurrentUser(): Promise<CurrentUser> {
+  return request<CurrentUser>("/me");
 }
 
 export function updateExchangeBalance(exchangeId: number, balanceUsdt: number): Promise<{ status: string }> {
@@ -201,9 +207,10 @@ export function getMarketWsUrl(exchangeSlug: string, symbol: string): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const isViteDevServer = window.location.port === "5173";
   const host = isViteDevServer ? "127.0.0.1:8001" : window.location.host;
+  const path = isViteDevServer ? "/api/v1/market/ws" : `${appBase}api/v1/market/ws`;
   const params = new URLSearchParams({
     exchange_slug: exchangeSlug,
     symbol
   });
-  return `${protocol}//${host}/api/v1/market/ws?${params.toString()}`;
+  return `${protocol}//${host}${path}?${params.toString()}`;
 }

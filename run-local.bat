@@ -54,7 +54,7 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":5173" ^| findstr "LISTENING
 timeout /t 1 /nobreak > nul
 
 echo [OK] Backend:  http://127.0.0.1:8001
-echo [OK] Frontend: http://127.0.0.1:5173
+echo [OK] Frontend: http://127.0.0.1:5173/pnl/
 echo [INFO] Starting backend in this window...
 
 start "PNL_BACKEND" /B cmd /c cd /d "%BACKEND_DIR%" ^&^& "%PYTHON_EXE%" -m uvicorn app.main:app --host 127.0.0.1 --port 8001

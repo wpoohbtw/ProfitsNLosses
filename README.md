@@ -40,8 +40,26 @@ run-local.bat
 - установит Python зависимости;
 - установит frontend зависимости, если нет `node_modules`;
 - поднимет backend на `http://127.0.0.1:8001`;
-- поднимет frontend на `http://127.0.0.1:5173`;
+- поднимет frontend на `http://127.0.0.1:5173/pnl/`;
 - при закрытии остановит локальные процессы.
+
+## Portal integration
+
+PnL user data is scoped by Portal user id. In local development the backend resolves the default user from the sibling Portal database:
+
+```text
+../SoftPortal/backend/data/portal.db
+```
+
+Useful overrides in `.env`:
+
+```text
+PNL_PORTAL_DB_PATH=../SoftPortal/backend/data/portal.db
+PNL_DEV_USERNAME=wpoohbtw
+PNL_DEV_USER_ID=1
+```
+
+When Portal proxies requests later, it should pass `X-Portal-User-Id` and optionally `X-Portal-Username`.
 
 ## Локальные данные
 
