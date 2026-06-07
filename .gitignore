@@ -16,6 +16,7 @@ backend/.env
 backend/.env.*
 
 # Internal working context
+AGENTS.md
 vault/
 .lazyweb/
 

@@ -50,6 +50,7 @@ GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 HYPERLIQUID_REST_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 KUCOIN_REST_BASE = "https://api-futures.kucoin.com"
+KUCOIN_UA_REST_BASE = "https://api.kucoin.com"
 KUCOIN_WS_URL = "wss://ws-api-futures.kucoin.com"
 MEXC_REST_BASE = "https://api.mexc.com"
 MEXC_WS_URL = "wss://contract.mexc.com/edge"
@@ -355,6 +356,8 @@ def fetch_kucoin_symbols() -> list[dict[str, object]]:
     symbols = []
     for item in payload.get("data", []):
         if item.get("quoteCurrency") != "USDT":
+            continue
+        if item.get("status") not in (None, "Open"):
             continue
         wire_symbol = str(item.get("symbol") or "")
         base_asset = str(item.get("baseCurrency") or wire_symbol.removesuffix("USDTM"))
@@ -820,13 +823,19 @@ def normalize_funding_history(
 
 
 def fetch_bingx_funding(wire_symbol: str) -> dict[str, object]:
-    ticker = fetch_json(f"{BINGX_REST_BASE}/openApi/swap/v2/quote/ticker?{urlencode({'symbol': wire_symbol})}")
-    data = ticker.get("data", {})
+    payload = fetch_json(f"{BINGX_REST_BASE}/openApi/swap/v2/quote/premiumIndex?{urlencode({'symbol': wire_symbol})}")
+    data = payload.get("data", {})
     if isinstance(data, list):
         data = first_item(data)
     if not isinstance(data, dict):
         data = {}
-    return build_funding("bingx", wire_symbol, data.get("fundingRate") or data.get("lastFundingRate"), data.get("nextFundingTime") or data.get("nextSettleTime"))
+    return build_funding(
+        "bingx",
+        wire_symbol,
+        data.get("lastFundingRate") or data.get("fundingRate"),
+        data.get("nextFundingTime") or data.get("nextSettleTime"),
+        interval_hours=int(parse_float(data.get("fundingIntervalHours"), 8)),
+    )
 
 
 def fetch_bitget_funding(wire_symbol: str) -> dict[str, object]:
@@ -836,14 +845,19 @@ def fetch_bitget_funding(wire_symbol: str) -> dict[str, object]:
         data = first_item(data)
     if not isinstance(data, dict):
         data = {}
-    if data.get("fundingRate") is None:
-        funding = fetch_json(f"{BITGET_REST_BASE}/api/v2/mix/market/current-fund-rate?{urlencode({'productType': 'usdt-futures', 'symbol': wire_symbol})}")
-        funding_data = funding.get("data", {})
-        if isinstance(funding_data, list):
-            funding_data = first_item(funding_data)
-        if isinstance(funding_data, dict):
-            data = {**funding_data, **data}
-    return build_funding("bitget", wire_symbol, data.get("fundingRate"), data.get("nextFundingTime") or data.get("fundingTime"))
+    funding = fetch_json(f"{BITGET_REST_BASE}/api/v2/mix/market/current-fund-rate?{urlencode({'productType': 'usdt-futures', 'symbol': wire_symbol})}")
+    funding_data = funding.get("data", {})
+    if isinstance(funding_data, list):
+        funding_data = first_item(funding_data)
+    if isinstance(funding_data, dict):
+        data = {**data, **funding_data}
+    return build_funding(
+        "bitget",
+        wire_symbol,
+        data.get("fundingRate"),
+        data.get("nextUpdate") or data.get("nextFundingTime") or data.get("fundingTime"),
+        interval_hours=int(parse_float(data.get("fundingRateInterval"), 8)),
+    )
 
 
 def fetch_gate_funding(wire_symbol: str) -> dict[str, object]:
@@ -864,13 +878,14 @@ def fetch_hyperliquid_funding(wire_symbol: str) -> dict[str, object]:
 
 
 def fetch_kucoin_funding(wire_symbol: str) -> dict[str, object]:
-    contract = fetch_json(f"{KUCOIN_REST_BASE}/api/v1/contracts/{wire_symbol}")
-    data = contract.get("data", {})
+    payload = fetch_json(f"{KUCOIN_UA_REST_BASE}/api/ua/v1/market/funding-rate?{urlencode({'symbol': wire_symbol})}")
+    data = payload.get("data", {})
     if not isinstance(data, dict):
         data = {}
-    funding_rate = data.get("fundingFeeRate") or data.get("fundingRate") or data.get("predictedFundingFeeRate")
-    next_time = data.get("nextFundingRateTime") or data.get("nextFundingTime") or data.get("fundingRateTime")
-    return build_funding("kucoin", wire_symbol, funding_rate, next_time)
+    funding_rate = data.get("nextFundingRate") or data.get("fundingFeeRate") or data.get("fundingRate")
+    next_time = data.get("fundingTime") or data.get("nextFundingRateTime") or data.get("nextFundingTime")
+    interval_ms = parse_float(data.get("currentGranularity") or data.get("newGranularity"), 28_800_000)
+    return build_funding("kucoin", wire_symbol, funding_rate, next_time, interval_hours=max(int(interval_ms // 3_600_000), 1))
 
 
 def fetch_mexc_funding(wire_symbol: str) -> dict[str, object]:
@@ -1015,6 +1030,7 @@ async def stream_gate(websocket: WebSocket, wire_symbol: str, snapshot: dict[str
     asks = {row["price"]: row["size"] for row in snapshot["asks"]}
     last_price = float(snapshot["lastPrice"])
     last_full_snapshot_at = 0.0
+    last_depth_id: int | None = None
     await send_status(websocket, "gate", wire_symbol)
 
     try:
@@ -1029,18 +1045,26 @@ async def stream_gate(websocket: WebSocket, wire_symbol: str, snapshot: dict[str
 
     async with websockets.connect(GATE_WS_URL, ping_interval=20, ping_timeout=20, open_timeout=5) as upstream:
         now = int(time.time())
-        await upstream.send(json.dumps({"time": now, "channel": "futures.order_book", "event": "subscribe", "payload": [wire_symbol, "20", "0"]}))
+        await upstream.send(json.dumps({"time": now, "channel": "futures.order_book_update", "event": "subscribe", "payload": [wire_symbol, "100ms", "100"]}))
         await upstream.send(json.dumps({"time": now, "channel": "futures.tickers", "event": "subscribe", "payload": [wire_symbol]}))
         async for raw_message in upstream:
             payload = json.loads(raw_message)
             result = payload.get("result", {})
-            if payload.get("channel") == "futures.order_book" and payload.get("event") in {"all", "update"}:
-                if payload.get("event") == "all":
-                    bids = {row["price"]: row["size"] for row in normalize_levels(result.get("bids", []))}
-                    asks = {row["price"]: row["size"] for row in normalize_levels(result.get("asks", []))}
+            if payload.get("channel") == "futures.order_book_update" and payload.get("event") == "update":
+                update_id = int(result.get("u") or 0)
+                first_update_id = int(result.get("U") or 0)
+                if result.get("full") is True:
+                    bids = {row["price"]: row["size"] for row in normalize_levels(result.get("b", []))}
+                    asks = {row["price"]: row["size"] for row in normalize_levels(result.get("a", []))}
+                    last_depth_id = update_id or last_depth_id
+                elif last_depth_id is not None and first_update_id and first_update_id != last_depth_id + 1:
+                    apply_levels(bids, normalize_levels(result.get("b", [])))
+                    apply_levels(asks, normalize_levels(result.get("a", [])))
+                    last_depth_id = update_id or last_depth_id
                 else:
-                    apply_levels(bids, normalize_levels(result.get("bids", [])))
-                    apply_levels(asks, normalize_levels(result.get("asks", [])))
+                    apply_levels(bids, normalize_levels(result.get("b", [])))
+                    apply_levels(asks, normalize_levels(result.get("a", [])))
+                    last_depth_id = update_id or last_depth_id
             elif payload.get("channel") == "futures.tickers":
                 last_price = float(result.get("last") or last_price)
             else:
