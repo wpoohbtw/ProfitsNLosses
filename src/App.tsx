@@ -282,6 +282,7 @@ const TRADE_TICKETS_STORAGE_KEY = "profits-n-losses-trade-tickets";
 const OPEN_POSITIONS_STORAGE_KEY = "profits-n-losses-open-positions";
 const LIVE_EXCHANGE_SLUGS = new Set(["aster", "binance", "bingx", "bitget", "bybit", "gate", "hyperliquid", "kucoin", "mexc", "okx"]);
 const ORDERBOOK_VISIBLE_LEVELS = 5;
+const SHOW_EXIT_ORDER_CONTROLS = false;
 
 function formatMoney(value: number): string {
   return currencyFormatter.format(value);
@@ -3125,10 +3126,12 @@ function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot
       <button className="open-trade-button close-trade-button" type="button" onClick={() => onCloseTrade(position)}>
         Закрыть сделку
       </button>
-      <button className="open-trade-button exit-order-button" type="button" onClick={() => onExitOrder(position, null)}>
-        Добавить TP/SL
-      </button>
-      {position.exitOrders.length > 0 ? (
+      {SHOW_EXIT_ORDER_CONTROLS ? (
+        <button className="open-trade-button exit-order-button" type="button" onClick={() => onExitOrder(position, null)}>
+          Добавить TP/SL
+        </button>
+      ) : null}
+      {SHOW_EXIT_ORDER_CONTROLS && position.exitOrders.length > 0 ? (
         <div className="exit-order-list">
           {position.exitOrders.map((order) => (
             <button className="exit-order-pill" type="button" key={order.id} onClick={() => onExitOrder(position, order)}>
