@@ -1,0 +1,16 @@
+[Unit]
+Description=ProfitsNLosses FastAPI backend
+After=network.target softportal-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/ProfitsNLosses/backend
+EnvironmentFile=/srv/ProfitsNLosses/.env
+ExecStart=/srv/ProfitsNLosses/backend/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=3
+User=softportal
+Group=softportal
+
+[Install]
+WantedBy=multi-user.target
