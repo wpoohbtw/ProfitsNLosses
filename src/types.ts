@@ -92,6 +92,34 @@ export type TradeRealizePnlPayload = {
   margin_usdt?: number;
 };
 
+export type TradeExitOrderType = "take_profit" | "stop_loss";
+export type TradeExitOrderTriggerMode = "price" | "pnl_percent";
+export type TradeExitOrderSizeMode = "percent" | "usdt";
+
+export type TradeExitOrder = {
+  id: number;
+  tradeId: number;
+  orderType: TradeExitOrderType;
+  triggerMode: TradeExitOrderTriggerMode;
+  triggerPrice: number;
+  pnlPercent: number;
+  sizeMode: TradeExitOrderSizeMode;
+  sizePercent: number;
+  sizeUsdt: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TradeExitOrderPayload = {
+  order_type: TradeExitOrderType;
+  trigger_mode: TradeExitOrderTriggerMode;
+  trigger_price: number;
+  pnl_percent: number;
+  size_mode: TradeExitOrderSizeMode;
+  size_percent: number;
+  size_usdt: number;
+};
+
 export type ExchangeTransferPayload = {
   from_exchange_id: number;
   to_exchange_id: number;
@@ -118,6 +146,7 @@ export type Trade = {
   realizedPnlUsdt: number;
   lastFundingAppliedAt: number | null;
   comment: string;
+  exitOrders: TradeExitOrder[];
   openedAt: string;
   closedAt: string | null;
   deletedAt: string | null;
@@ -198,6 +227,7 @@ export type MarketSnapshot = {
   exchangeSlug: string;
   symbol: string;
   wireSymbol: string;
+  quoteAsset: string;
   lastPrice: number;
   bestBid: number | null;
   bestAsk: number | null;

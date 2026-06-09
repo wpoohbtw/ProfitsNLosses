@@ -9,7 +9,6 @@ from fastapi import Header, HTTPException, status
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
 DEFAULT_PORTAL_DB_PATH = PROJECT_DIR.parent / "SoftPortal" / "backend" / "data" / "portal.db"
-DEFAULT_PORTAL_USERNAME = "wpoohbtw"
 
 
 def load_local_env() -> None:
@@ -36,8 +35,15 @@ def get_portal_db_path() -> Path:
 
 
 def get_default_portal_username() -> str:
-    username = os.getenv("PNL_DEV_USERNAME") or os.getenv("PNL_DEFAULT_USERNAME") or DEFAULT_PORTAL_USERNAME
-    return username.strip() or DEFAULT_PORTAL_USERNAME
+    username = (os.getenv("PNL_DEV_USERNAME") or os.getenv("PNL_DEFAULT_USERNAME") or "").strip()
+    if not username:
+        raise RuntimeError("Set PNL_DEV_USERNAME for local ProfitsNLosses access")
+    return username
+
+
+def get_legacy_owner_username() -> str:
+    username = (os.getenv("PNL_LEGACY_OWNER_USERNAME") or os.getenv("PNL_LEGACY_DEFAULT_USERNAME") or "").strip()
+    return username or get_default_portal_username()
 
 
 def find_portal_user_id(username: str | None = None) -> int:
@@ -63,6 +69,13 @@ def get_default_portal_user_id() -> int:
     if raw_user_id:
         return int(raw_user_id)
     return find_portal_user_id()
+
+
+def get_legacy_owner_user_id() -> int:
+    raw_user_id = os.getenv("PNL_LEGACY_OWNER_USER_ID", "").strip()
+    if raw_user_id:
+        return int(raw_user_id)
+    return find_portal_user_id(get_legacy_owner_username())
 
 
 def get_current_portal_user(

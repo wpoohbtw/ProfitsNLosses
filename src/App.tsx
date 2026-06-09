@@ -27,9 +27,11 @@ import {
 } from "lucide-react";
 import {
   closeTrade,
+  createTradeExitOrder,
   createSituation,
   createTrade,
   deleteSituation,
+  deleteTradeExitOrder,
   deleteTrade,
   getExchanges,
   getCurrentUser,
@@ -46,6 +48,7 @@ import {
   testSituationSettings,
   transferBetweenExchanges,
   updateTradeGroupComment,
+  updateTradeExitOrder,
   updateSituation,
   updateSituationSettings,
   updateExchangeBalance
@@ -63,6 +66,8 @@ import type {
   SituationSettings,
   SituationSettingsTestResponse,
   Trade,
+  TradeExitOrder,
+  TradeExitOrderPayload,
   TradeSide,
   TradeSizeUnit
 } from "./types";
@@ -110,6 +115,7 @@ type OpenPosition = {
   realizedPnlUsdt: number;
   realizedPricePnlUsdt: number;
   lastFundingAppliedAt: number | null;
+  exitOrders: TradeExitOrder[];
   openedAt: string;
 };
 
@@ -140,6 +146,7 @@ type OpenTradeDraft = {
   ticket: TradeTicket;
   exchange: Exchange;
   symbol: string;
+  quoteAsset: string;
   entryPrice: number;
   markPrice: number;
   sizeValue: number;
@@ -156,6 +163,33 @@ type CloseTradeDraft = {
   customExitPrice: string;
   percentValue: string;
   usdtValue: string;
+};
+
+type ExitOrderMetricMode = "roe" | "pnl";
+
+type ExitOrderLegDraft = {
+  triggerMode: TradeExitOrder["triggerMode"];
+  metricMode: ExitOrderMetricMode;
+  triggerPrice: string;
+  pnlPercent: string;
+  pnlUsdt: string;
+  sizeMode: TradeExitOrder["sizeMode"];
+  sizePercent: string;
+  sizeUsdt: string;
+};
+
+type ExitOrderDraft = {
+  position: OpenPosition;
+  order: TradeExitOrder | null;
+  orderType: TradeExitOrder["orderType"];
+  triggerMode: TradeExitOrder["triggerMode"];
+  triggerPrice: string;
+  pnlPercent: string;
+  sizeMode: TradeExitOrder["sizeMode"];
+  sizePercent: string;
+  sizeUsdt: string;
+  positionScope: "full" | "partial";
+  legs: Record<TradeExitOrder["orderType"], ExitOrderLegDraft>;
 };
 
 type DepositDraft = {
@@ -414,7 +448,8 @@ function getInitialOpenPositions(user: CurrentUser | null = null): OpenPosition[
           notionalUsdt,
           realizedPnlUsdt: Number.isFinite(position.realizedPnlUsdt) ? position.realizedPnlUsdt : 0,
           realizedPricePnlUsdt: Number.isFinite(position.realizedPricePnlUsdt) ? position.realizedPricePnlUsdt : 0,
-          lastFundingAppliedAt: Number.isFinite(position.lastFundingAppliedAt) ? position.lastFundingAppliedAt : null
+          lastFundingAppliedAt: Number.isFinite(position.lastFundingAppliedAt) ? position.lastFundingAppliedAt : null,
+          exitOrders: Array.isArray(position.exitOrders) ? position.exitOrders : []
         };
       });
   } catch {
@@ -475,6 +510,7 @@ function tradeToOpenPosition(trade: Trade): OpenPosition | null {
     realizedPnlUsdt: trade.realizedPnlUsdt,
     realizedPricePnlUsdt: trade.realizedPnlUsdt,
     lastFundingAppliedAt: trade.lastFundingAppliedAt,
+    exitOrders: trade.exitOrders ?? [],
     openedAt: trade.openedAt
   };
 }
@@ -549,6 +585,16 @@ function getPositionPnlAtPrice(position: OpenPosition, closePrice: number): { pn
   const pnlUsdt = (closePrice - position.entryPrice) * quantity * direction;
   const pnlPercent = position.marginUsdt > 0 ? (pnlUsdt / position.marginUsdt) * 100 : 0;
   return { pnlUsdt, pnlPercent, closePrice };
+}
+
+function getPositionPriceForPnlPercent(position: OpenPosition, pnlPercent: number): number {
+  const quantity = getPositionQuantity(position);
+  const direction = position.side === "long" ? 1 : -1;
+  if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(pnlPercent)) {
+    return position.entryPrice;
+  }
+  const pnlUsdt = position.marginUsdt * (pnlPercent / 100);
+  return Math.max(position.entryPrice + pnlUsdt / (quantity * direction), 0);
 }
 
 function getPositionCloseNotional(position: OpenPosition): number {
@@ -770,6 +816,7 @@ function App() {
   const [situationDeleteDraft, setSituationDeleteDraft] = useState<Situation | null>(null);
   const [openTradeDraft, setOpenTradeDraft] = useState<OpenTradeDraft | null>(null);
   const [closeTradeDraft, setCloseTradeDraft] = useState<CloseTradeDraft | null>(null);
+  const [exitOrderDraft, setExitOrderDraft] = useState<ExitOrderDraft | null>(null);
   const [depositDraft, setDepositDraft] = useState<DepositDraft | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSituationsLoading, setIsSituationsLoading] = useState(false);
@@ -1207,6 +1254,7 @@ function App() {
       ticket,
       exchange,
       symbol: resolvedSymbol,
+      quoteAsset: snapshot?.quoteAsset ?? "USDT",
       entryPrice: price,
       markPrice,
       sizeValue: size,
@@ -1260,6 +1308,7 @@ function App() {
         realizedPnlUsdt: 0,
         realizedPricePnlUsdt: 0,
         lastFundingAppliedAt: null,
+        exitOrders: [],
         openedAt: new Date().toISOString()
       };
       setOpenPositions((current) => [...current, nextPosition]);
@@ -1286,6 +1335,127 @@ function App() {
       percentValue,
       usdtValue: String(roundInput(getPositionCloseNotional(position) * (Number(percentValue) / 100)))
     });
+  }
+
+  function requestExitOrder(position: OpenPosition, order: TradeExitOrder | null = null) {
+    const marketPrice = getPositionClosePrice(position, positionSnapshots[position.id] ?? null);
+    const defaultType: TradeExitOrder["orderType"] = order?.orderType ?? "take_profit";
+    const positionNotional = getPositionCloseNotional(position);
+    const makeLeg = (orderType: TradeExitOrder["orderType"]): ExitOrderLegDraft => {
+      const sourceOrder = order?.orderType === orderType ? order : null;
+      const defaultPnlPercent = orderType === "take_profit" ? 25 : -10;
+      const pnlPercent = sourceOrder?.pnlPercent ?? defaultPnlPercent;
+      const defaultPrice = getPositionPriceForPnlPercent(position, pnlPercent);
+      return {
+        triggerMode: sourceOrder?.triggerMode ?? "price",
+        metricMode: sourceOrder?.triggerMode === "pnl_percent" ? "roe" : "pnl",
+        triggerPrice: String(roundInput(sourceOrder?.triggerPrice ?? (Number.isFinite(defaultPrice) && defaultPrice > 0 ? defaultPrice : marketPrice))),
+        pnlPercent: String(roundInput(pnlPercent)),
+        pnlUsdt: String(roundInput(position.marginUsdt * (pnlPercent / 100))),
+        sizeMode: sourceOrder?.sizeMode ?? "percent",
+        sizePercent: String(roundInput(sourceOrder?.sizePercent ?? 100)),
+        sizeUsdt: String(roundInput(sourceOrder?.sizeUsdt ?? positionNotional))
+      };
+    };
+    const legs = {
+      take_profit: makeLeg("take_profit"),
+      stop_loss: makeLeg("stop_loss")
+    };
+    const activeLeg = legs[defaultType];
+    setExitOrderDraft({
+      position,
+      order,
+      orderType: defaultType,
+      triggerMode: activeLeg.triggerMode,
+      triggerPrice: activeLeg.triggerPrice,
+      pnlPercent: activeLeg.pnlPercent,
+      sizeMode: activeLeg.sizeMode,
+      sizePercent: activeLeg.sizePercent,
+      sizeUsdt: activeLeg.sizeUsdt,
+      positionScope: numberFromInput(activeLeg.sizePercent) >= 100 ? "full" : "partial",
+      legs
+    });
+  }
+
+  async function saveExitOrder() {
+    if (!exitOrderDraft) {
+      return;
+    }
+    const position = openPositions.find((item) => item.id === exitOrderDraft.position.id) ?? exitOrderDraft.position;
+    const orderTypesToSave: TradeExitOrder["orderType"][] = exitOrderDraft.order || exitOrderDraft.positionScope !== "full"
+      ? [exitOrderDraft.orderType]
+      : ["take_profit", "stop_loss"];
+    const payloads = orderTypesToSave.map((orderType) => {
+      const leg = exitOrderDraft.legs[orderType];
+      const triggerPrice = numberFromInput(leg.triggerPrice);
+      const pnlPercent = numberFromInput(leg.pnlPercent);
+      const sizePercent = numberFromInput(leg.sizePercent);
+      const sizeUsdt = numberFromInput(leg.sizeUsdt);
+      return {
+        orderType,
+        payload: {
+          order_type: orderType,
+          trigger_mode: leg.triggerMode,
+          trigger_price: triggerPrice,
+          pnl_percent: pnlPercent,
+          size_mode: leg.sizeMode,
+          size_percent: sizePercent,
+          size_usdt: sizeUsdt
+        } satisfies TradeExitOrderPayload
+      };
+    });
+    if (
+      payloads.some(({ payload }) => (
+        !Number.isFinite(payload.trigger_price) ||
+        payload.trigger_price <= 0 ||
+        !Number.isFinite(payload.pnl_percent) ||
+        !Number.isFinite(payload.size_percent) ||
+        payload.size_percent <= 0 ||
+        payload.size_percent > 100 ||
+        !Number.isFinite(payload.size_usdt) ||
+        payload.size_usdt <= 0
+      ))
+    ) {
+      setError("Введите корректные параметры TP/SL");
+      return;
+    }
+    setIsSaving(true);
+    setError(null);
+    try {
+      for (const { orderType, payload } of payloads) {
+        const existingOrder = exitOrderDraft.order?.orderType === orderType
+          ? exitOrderDraft.order
+          : position.exitOrders.find((order) => order.orderType === orderType && order.sizePercent >= 100);
+        if (existingOrder) {
+          await updateTradeExitOrder(position.id, existingOrder.id, payload);
+        } else {
+          await createTradeExitOrder(position.id, payload);
+        }
+      }
+      await loadData();
+      setExitOrderDraft(null);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Не удалось сохранить TP/SL");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function removeExitOrder(order: TradeExitOrder) {
+    if (!exitOrderDraft) {
+      return;
+    }
+    setIsSaving(true);
+    setError(null);
+    try {
+      await deleteTradeExitOrder(exitOrderDraft.position.id, order.id);
+      await loadData();
+      setExitOrderDraft(null);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Не удалось удалить TP/SL");
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   async function confirmCloseTrade() {
@@ -1519,6 +1689,7 @@ function App() {
             expandedSymbols={expandedSymbols}
             onToggleSymbol={(symbol) => setExpandedSymbols((current) => ({ ...current, [symbol]: !current[symbol] }))}
             onCloseTrade={requestCloseTrade}
+            onExitOrder={requestExitOrder}
             onDeleteTrade={deleteOpenPosition}
             onPositionSnapshot={handlePositionSnapshot}
           />
@@ -1624,6 +1795,18 @@ function App() {
           onConfirm={() => void confirmCloseTrade()}
         />
       ) : null}
+
+      {exitOrderDraft ? (
+        <ExitOrderModal
+          draft={exitOrderDraft}
+          isSaving={isSaving}
+          snapshot={positionSnapshots[exitOrderDraft.position.id] ?? null}
+          onChange={setExitOrderDraft}
+          onClose={() => !isSaving && setExitOrderDraft(null)}
+          onDeleteOrder={(order) => void removeExitOrder(order)}
+          onSave={() => void saveExitOrder()}
+        />
+      ) : null}
     </main>
   );
 }
@@ -1710,6 +1893,7 @@ type TradesPageProps = {
   onUpdateTicket: (ticketId: number, patch: Partial<TradeTicket>) => void;
   onOpenTrade: (ticket: TradeTicket, snapshot?: MarketSnapshot | null) => void;
   onCloseTrade: (position: OpenPosition) => void;
+  onExitOrder: (position: OpenPosition, order?: TradeExitOrder | null) => void;
   onDeleteTrade: (position: OpenPosition) => void;
   onToggleSymbol: (symbol: string) => void;
   onPositionSnapshot: (positionId: number, snapshot: MarketSnapshot) => void;
@@ -1726,6 +1910,7 @@ function TradesPage({
   onUpdateTicket,
   onOpenTrade,
   onCloseTrade,
+  onExitOrder,
   onDeleteTrade,
   onToggleSymbol,
   onPositionSnapshot
@@ -1755,6 +1940,7 @@ function TradesPage({
         snapshots={positionSnapshots}
         expandedSymbols={expandedSymbols}
         onCloseTrade={onCloseTrade}
+        onExitOrder={onExitOrder}
         onDeleteTrade={onDeleteTrade}
         onPositionSnapshot={onPositionSnapshot}
         onToggleSymbol={onToggleSymbol}
@@ -2617,6 +2803,7 @@ type OpenPositionsPanelProps = {
   snapshots: Record<number, MarketSnapshot>;
   expandedSymbols: Record<string, boolean>;
   onCloseTrade: (position: OpenPosition) => void;
+  onExitOrder: (position: OpenPosition, order?: TradeExitOrder | null) => void;
   onDeleteTrade: (position: OpenPosition) => void;
   onToggleSymbol: (symbol: string) => void;
   onPositionSnapshot: (positionId: number, snapshot: MarketSnapshot) => void;
@@ -2628,6 +2815,7 @@ function OpenPositionsPanel({
   snapshots,
   expandedSymbols,
   onCloseTrade,
+  onExitOrder,
   onDeleteTrade,
   onToggleSymbol,
   onPositionSnapshot
@@ -2725,6 +2913,7 @@ function OpenPositionsPanel({
                         snapshot={snapshots[position.id] ?? null}
                         status={marketStatuses[position.id] ?? null}
                         onCloseTrade={onCloseTrade}
+                        onExitOrder={onExitOrder}
                         onDeleteTrade={onDeleteTrade}
                       />
                     ))}
@@ -2747,6 +2936,7 @@ type OpenPositionCardProps = {
   snapshot: MarketSnapshot | null;
   status: string | null;
   onCloseTrade: (position: OpenPosition) => void;
+  onExitOrder: (position: OpenPosition, order?: TradeExitOrder | null) => void;
   onDeleteTrade: (position: OpenPosition) => void;
 };
 
@@ -2852,7 +3042,7 @@ function PositionFundingFeed({
   return null;
 }
 
-function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot, status, onCloseTrade, onDeleteTrade }: OpenPositionCardProps) {
+function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot, status, onCloseTrade, onExitOrder, onDeleteTrade }: OpenPositionCardProps) {
   const [now, setNow] = useState(() => Date.now());
   const pnl = getPositionPnl(position, snapshot);
   const quantity = getPositionQuantity(position);
@@ -2935,6 +3125,20 @@ function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot
       <button className="open-trade-button close-trade-button" type="button" onClick={() => onCloseTrade(position)}>
         Закрыть сделку
       </button>
+      <button className="open-trade-button exit-order-button" type="button" onClick={() => onExitOrder(position, null)}>
+        Добавить TP/SL
+      </button>
+      {position.exitOrders.length > 0 ? (
+        <div className="exit-order-list">
+          {position.exitOrders.map((order) => (
+            <button className="exit-order-pill" type="button" key={order.id} onClick={() => onExitOrder(position, order)}>
+              <span>{order.orderType === "take_profit" ? "TP" : "SL"}</span>
+              <strong>{formatPrice(order.triggerPrice)}</strong>
+              <small>{formatPercent(order.pnlPercent)} · {compactFormatter.format(order.sizePercent)}%</small>
+            </button>
+          ))}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -2995,6 +3199,7 @@ function OrderBook({ symbol, snapshot, status }: { symbol: string; snapshot: Mar
   const midPrice = bestAsk && bestBid ? (bestAsk + bestBid) / 2 : 0;
   const spreadPercent = midPrice > 0 ? (spread / midPrice) * 100 : 0;
   const centerPrice = snapshot?.lastPrice || midPrice;
+  const quoteAsset = snapshot?.quoteAsset || "USDT";
 
   return (
     <div className="orderbook">
@@ -3002,12 +3207,12 @@ function OrderBook({ symbol, snapshot, status }: { symbol: string; snapshot: Mar
         <span>Стакан</span>
         <div className="orderbook-symbol">
           <MarketStatusDot hasSnapshot={Boolean(snapshot)} status={status} />
-          <strong>{symbol}/USDT</strong>
+          <strong>{symbol}/{quoteAsset}</strong>
         </div>
       </div>
       <div className="book-columns" aria-hidden="true">
-        <span>Price (USDT)</span>
-        <span>Size (USDT)</span>
+        <span>Price ({quoteAsset})</span>
+        <span>Size ({quoteAsset})</span>
       </div>
       <div className="book-rows asks">
         {asks.map((row, index) => (
@@ -3327,6 +3532,7 @@ function OpenTradeConfirmModal({
           marginMode={draft.marginMode}
           markPrice={draft.markPrice}
           marginUsdt={draft.marginUsdt}
+          quoteAsset={draft.quoteAsset}
           side={draft.ticket.side}
           symbol={draft.symbol}
         />
@@ -3426,6 +3632,7 @@ function CloseTradeConfirmModal({
           markPrice={getSnapshotMarkPrice(snapshot, priceSelection.marketPrice)}
           marketPrice={priceSelection.marketPrice}
           marginUsdt={draft.position.marginUsdt}
+          quoteAsset={snapshot?.quoteAsset ?? "USDT"}
           side={draft.position.side}
           symbol={draft.position.symbol}
         />
@@ -3510,6 +3717,366 @@ function CloseTradeConfirmModal({
   );
 }
 
+function ExitOrderModal({
+  draft,
+  isSaving,
+  snapshot,
+  onChange,
+  onClose,
+  onDeleteOrder,
+  onSave
+}: {
+  draft: ExitOrderDraft;
+  isSaving: boolean;
+  snapshot: MarketSnapshot | null;
+  onChange: (draft: ExitOrderDraft) => void;
+  onClose: () => void;
+  onDeleteOrder?: (order: TradeExitOrder) => void;
+  onSave: () => void;
+}) {
+  const [metricMenu, setMetricMenu] = useState<TradeExitOrder["orderType"] | null>(null);
+  const positionNotional = getPositionCloseNotional(draft.position);
+  const marketPrice = getPositionClosePrice(draft.position, snapshot);
+  const activeLeg = draft.legs[draft.orderType];
+  const triggerPrice = numberFromInput(activeLeg.triggerPrice);
+  const pnlPercent = numberFromInput(activeLeg.pnlPercent);
+  const sizePercent = numberFromInput(activeLeg.sizePercent);
+  const sizeUsdt = numberFromInput(activeLeg.sizeUsdt);
+  const priceIsValid = Number.isFinite(triggerPrice) && triggerPrice > 0;
+  const sizeIsValid = Number.isFinite(sizePercent) && sizePercent > 0 && sizePercent <= 100 && Number.isFinite(sizeUsdt) && sizeUsdt > 0;
+  const isSaveDisabled = isSaving || !priceIsValid || !Number.isFinite(pnlPercent) || !sizeIsValid;
+  const triggerPnl = priceIsValid ? getPositionPnlAtPrice(draft.position, triggerPrice) : null;
+  const proportionalPnl = triggerPnl && Number.isFinite(sizePercent) ? triggerPnl.pnlUsdt * (sizePercent / 100) : null;
+  const existingOrders = draft.position.exitOrders ?? [];
+  const sideLabel = draft.position.side === "long" ? "Лонг" : "Шорт";
+
+  function withActiveLeg(nextDraft: ExitOrderDraft, orderType: TradeExitOrder["orderType"]): ExitOrderDraft {
+    const leg = nextDraft.legs[orderType];
+    return {
+      ...nextDraft,
+      orderType,
+      triggerMode: leg.triggerMode,
+      triggerPrice: leg.triggerPrice,
+      pnlPercent: leg.pnlPercent,
+      sizeMode: leg.sizeMode,
+      sizePercent: leg.sizePercent,
+      sizeUsdt: leg.sizeUsdt,
+      positionScope: numberFromInput(leg.sizePercent) >= 100 ? "full" : "partial"
+    };
+  }
+
+  function updateLeg(orderType: TradeExitOrder["orderType"], patch: Partial<ExitOrderLegDraft>) {
+    const nextDraft = {
+      ...draft,
+      legs: {
+        ...draft.legs,
+        [orderType]: {
+          ...draft.legs[orderType],
+          ...patch
+        }
+      }
+    };
+    onChange(withActiveLeg(nextDraft, orderType));
+  }
+
+  function setOrderType(orderType: TradeExitOrder["orderType"]) {
+    onChange(withActiveLeg(draft, orderType));
+  }
+
+  function setTriggerPrice(value: string, orderType: TradeExitOrder["orderType"]) {
+    const nextPrice = numberFromInput(value);
+    const nextPnl = Number.isFinite(nextPrice) && nextPrice > 0 ? getPositionPnlAtPrice(draft.position, nextPrice).pnlPercent : pnlPercent;
+    const nextPnlUsdt = Number.isFinite(nextPnl) ? draft.position.marginUsdt * (nextPnl / 100) : numberFromInput(draft.legs[orderType].pnlUsdt);
+    updateLeg(orderType, {
+      triggerMode: "price",
+      triggerPrice: value,
+      pnlPercent: Number.isFinite(nextPnl) ? String(roundInput(nextPnl)) : draft.legs[orderType].pnlPercent,
+      pnlUsdt: Number.isFinite(nextPnlUsdt) ? String(roundInput(nextPnlUsdt)) : draft.legs[orderType].pnlUsdt
+    });
+  }
+
+  function setMetricMode(orderType: TradeExitOrder["orderType"], metricMode: ExitOrderMetricMode) {
+    setMetricMenu(null);
+    updateLeg(orderType, {
+      metricMode,
+      triggerMode: metricMode === "roe" ? "pnl_percent" : "price"
+    });
+  }
+
+  function setPnlMetric(value: string, orderType: TradeExitOrder["orderType"]) {
+    const leg = draft.legs[orderType];
+    const rawValue = numberFromInput(value);
+    const nextPnlPercent = leg.metricMode === "roe" ? rawValue : draft.position.marginUsdt > 0 ? (rawValue / draft.position.marginUsdt) * 100 : 0;
+    const nextPnlUsdt = leg.metricMode === "roe" ? draft.position.marginUsdt * (rawValue / 100) : rawValue;
+    const nextPrice = getPositionPriceForPnlPercent(draft.position, nextPnlPercent);
+    updateLeg(orderType, {
+      triggerMode: leg.metricMode === "roe" ? "pnl_percent" : "price",
+      pnlPercent: Number.isFinite(nextPnlPercent) ? String(roundInput(nextPnlPercent)) : leg.pnlPercent,
+      pnlUsdt: Number.isFinite(nextPnlUsdt) ? String(roundInput(nextPnlUsdt)) : leg.pnlUsdt,
+      triggerPrice: Number.isFinite(nextPrice) && nextPrice > 0 ? String(roundInput(nextPrice)) : draft.triggerPrice
+    });
+  }
+
+  function setSizePercent(value: string, orderType: TradeExitOrder["orderType"]) {
+    const nextPercent = numberFromInput(value);
+    const nextUsdt = Number.isFinite(nextPercent) ? positionNotional * (Math.min(Math.max(nextPercent, 0), 100) / 100) : sizeUsdt;
+    updateLeg(orderType, {
+      sizeMode: "percent",
+      sizePercent: value,
+      sizeUsdt: Number.isFinite(nextUsdt) ? String(roundInput(nextUsdt)) : draft.sizeUsdt
+    });
+  }
+
+  function setSizeUsdt(value: string, orderType: TradeExitOrder["orderType"]) {
+    const nextUsdt = numberFromInput(value);
+    const nextPercent = Number.isFinite(nextUsdt) && positionNotional > 0 ? (nextUsdt / positionNotional) * 100 : sizePercent;
+    updateLeg(orderType, {
+      sizeMode: "usdt",
+      sizeUsdt: value,
+      sizePercent: Number.isFinite(nextPercent) ? String(roundInput(Math.min(Math.max(nextPercent, 0), 100))) : draft.sizePercent
+    });
+  }
+
+  function setPositionScope(positionScope: ExitOrderDraft["positionScope"], orderType?: TradeExitOrder["orderType"]) {
+    const targetTypes = orderType ? [orderType] : (["take_profit", "stop_loss"] as TradeExitOrder["orderType"][]);
+    const nextLegs = { ...draft.legs };
+    for (const type of targetTypes) {
+      const legPercent = numberFromInput(nextLegs[type].sizePercent);
+      const nextPercent = positionScope === "full" ? 100 : Math.min(Number.isFinite(legPercent) && legPercent > 0 && legPercent < 100 ? legPercent : 50, 99);
+      nextLegs[type] = {
+        ...nextLegs[type],
+        sizeMode: "percent",
+        sizePercent: String(roundInput(nextPercent)),
+        sizeUsdt: String(roundInput(positionNotional * (nextPercent / 100)))
+      };
+    }
+    const activeType = orderType ?? draft.orderType;
+    onChange(withActiveLeg({
+      ...draft,
+      sizeMode: "percent",
+      positionScope,
+      legs: nextLegs
+    }, activeType));
+  }
+
+  function loadOrder(order: TradeExitOrder) {
+    const nextLeg: ExitOrderLegDraft = {
+      triggerMode: order.triggerMode,
+      metricMode: order.triggerMode === "pnl_percent" ? "roe" : "pnl",
+      triggerPrice: String(roundInput(order.triggerPrice)),
+      pnlPercent: String(roundInput(order.pnlPercent)),
+      pnlUsdt: String(roundInput(draft.position.marginUsdt * (order.pnlPercent / 100))),
+      sizeMode: order.sizeMode,
+      sizePercent: String(roundInput(order.sizePercent)),
+      sizeUsdt: String(roundInput(order.sizeUsdt))
+    };
+    onChange(withActiveLeg({
+      ...draft,
+      order,
+      legs: {
+        ...draft.legs,
+        [order.orderType]: nextLeg
+      }
+    }, order.orderType));
+  }
+
+  function orderTimeLabel(order: TradeExitOrder) {
+    return formatDateTime(order.createdAt ?? order.updatedAt).replace(", ", " ");
+  }
+
+  function OrderBlock({ type }: { type: TradeExitOrder["orderType"] }) {
+    const leg = draft.legs[type];
+    const isActive = draft.orderType === type;
+    const title = type === "take_profit" ? "Срабатывание рыночного TP" : "Срабатывание рыночного SL";
+    const label = type === "take_profit" ? "TP" : "SL";
+    const legTriggerPrice = numberFromInput(leg.triggerPrice);
+    const legPnlPercent = numberFromInput(leg.pnlPercent);
+    const legSizePercent = numberFromInput(leg.sizePercent);
+    const legPnl = Number.isFinite(legTriggerPrice) && legTriggerPrice > 0 ? getPositionPnlAtPrice(draft.position, legTriggerPrice) : null;
+    const legProportionalPnl = legPnl && Number.isFinite(legSizePercent) ? legPnl.pnlUsdt * (legSizePercent / 100) : null;
+
+    return (
+      <section className={isActive ? "tp-sl-order-block is-active" : "tp-sl-order-block"}>
+        <div className="tp-sl-block-head">
+          <button type="button" onClick={() => setOrderType(type)}>
+            <span>{title}</span>
+          </button>
+        </div>
+
+        <div className="tp-sl-input-row">
+          <div className="tp-sl-field">
+            <input
+              inputMode="decimal"
+              value={leg.triggerPrice}
+              onChange={(event) => setTriggerPrice(event.target.value, type)}
+              placeholder="Триггер..."
+            />
+            <span>USDT</span>
+          </div>
+          <div className="tp-sl-field">
+            <input
+              inputMode="decimal"
+              value={leg.metricMode === "roe" ? leg.pnlPercent : leg.pnlUsdt}
+              onChange={(event) => setPnlMetric(event.target.value, type)}
+              placeholder={leg.metricMode === "roe" ? "%" : "USDT"}
+            />
+            <span>{leg.metricMode === "roe" ? "%" : "USDT"}</span>
+            <div className="tp-sl-metric-menu">
+              <button type="button" onClick={() => { setOrderType(type); setMetricMenu(metricMenu === type ? null : type); }}>
+                {leg.metricMode === "roe" ? "ROE" : "PNL"}
+                <ChevronDown size={14} />
+              </button>
+              {metricMenu === type ? (
+                <div className="tp-sl-metric-options">
+                  <button type="button" onClick={() => setMetricMode(type, "pnl")}>PNL</button>
+                  <button type="button" onClick={() => setMetricMode(type, "roe")}>ROE</button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="tp-sl-amount">
+          <div className="tp-sl-amount-head">
+            <span>Кол-во</span>
+          </div>
+          <div className="tp-sl-wide-field">
+            <input
+              inputMode="decimal"
+              value={leg.sizeUsdt}
+              onChange={(event) => setSizeUsdt(event.target.value, type)}
+            />
+            <span>USDT</span>
+            <button type="button" onClick={() => setPositionScope("full", type)}>Все</button>
+          </div>
+          <div className="size-slider tp-sl-size-slider">
+            <input
+              max="100"
+              min="0"
+              step="1"
+              type="range"
+              value={Number.isFinite(legSizePercent) ? Math.min(Math.max(legSizePercent, 0), 100) : 0}
+              onInput={(event) => setSizePercent(event.currentTarget.value, type)}
+              onChange={(event) => setSizePercent(event.currentTarget.value, type)}
+            />
+            <div className="slider-marks">
+              {[25, 50, 75, 100].map((mark) => (
+                <button key={mark} type="button" onClick={() => setSizePercent(String(mark), type)}>
+                  {mark}%
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {Number.isFinite(legTriggerPrice) && legTriggerPrice > 0 && legPnl ? (
+          <p className="tp-sl-hint">
+            Когда цена достигнет <strong>{formatPrice(legTriggerPrice)}</strong>, сработает ордер {label} по <strong>рыночной цене</strong>.
+            Расчетный PNL составит{" "}
+            <strong className={legPnl.pnlUsdt >= 0 ? "positive-text tp-sl-calculated-value" : "negative-text tp-sl-calculated-value"}>
+              {legProportionalPnl === null ? "—" : formatSigned(legProportionalPnl)}
+            </strong>
+            , ROE <strong className={legPnl.pnlPercent >= 0 ? "positive-text tp-sl-calculated-value" : "negative-text tp-sl-calculated-value"}>{formatPercent(legPnl.pnlPercent)}</strong>.
+          </p>
+        ) : null}
+      </section>
+    );
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="trade-confirm-modal exit-order-modal tp-sl-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="modal-close" type="button" onClick={onClose} aria-label="Закрыть окно">
+          <X size={18} />
+        </button>
+
+        <div className="tp-sl-title">
+          <h2>Настройки TP/SL</h2>
+          <p>
+            {draft.position.symbol} Бессрочный <strong className={draft.position.side === "long" ? "positive-text" : "negative-text"}>{sideLabel} {draft.position.leverage}X</strong>
+          </p>
+        </div>
+
+        <div className="tp-sl-market-stats">
+          <div>
+            <span>Ср. цена входа</span>
+            <strong>{formatPrice(draft.position.entryPrice)}</strong>
+          </div>
+          <div>
+            <span>Последняя</span>
+            <strong>{formatPrice(marketPrice)}</strong>
+          </div>
+          <div>
+            <span>Ориент. цена ликв.</span>
+            <strong className="warning-text">—</strong>
+          </div>
+        </div>
+
+        <div className="tp-sl-tabs" role="tablist" aria-label="Размер позиции TP/SL">
+          <button
+            className={draft.positionScope === "full" ? "is-selected" : ""}
+            type="button"
+            onClick={() => setPositionScope("full")}
+          >
+            Вся позиция
+          </button>
+          <button
+            className={draft.positionScope === "partial" ? "is-selected" : ""}
+            type="button"
+            onClick={() => setPositionScope("partial")}
+          >
+            Частичная позиция
+          </button>
+        </div>
+
+        <div className="tp-sl-blocks">
+          <OrderBlock type="take_profit" />
+          <OrderBlock type="stop_loss" />
+        </div>
+
+        {existingOrders.length > 0 ? (
+          <section className="tp-sl-existing">
+            <div className="tp-sl-existing-head">
+              <h3>Ордер TP/SL</h3>
+            </div>
+            <div className="tp-sl-order-table">
+              {existingOrders.map((order) => (
+                <div className="tp-sl-order-row" key={order.id}>
+                  <div>
+                    <small>{orderTimeLabel(order)}</small>
+                    <span className={order.orderType === "take_profit" ? "positive-text" : "negative-text"}>
+                      {order.orderType === "take_profit" ? "TP" : "SL"}: Последняя {order.orderType === "take_profit" ? ">=" : "<="}{formatPrice(order.triggerPrice)}
+                    </span>
+                  </div>
+                  <span>{order.orderType === "take_profit" ? "TP" : "SL"}: Рыночная</span>
+                  <strong>{formatPrice(order.sizeUsdt)}</strong>
+                  <div className="tp-sl-table-actions">
+                    <button type="button" onClick={() => loadOrder(order)} aria-label="Изменить TP/SL">
+                      <SquarePen size={16} />
+                    </button>
+                    <button type="button" onClick={() => onDeleteOrder?.(order)} disabled={isSaving} aria-label="Удалить TP/SL">
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <div className="modal-actions tp-sl-actions">
+          <button className="ghost-action" type="button" onClick={onClose} disabled={isSaving}>
+            Отменить
+          </button>
+          <button className="primary-action" type="button" onClick={onSave} disabled={isSaveDisabled}>
+            {isSaving ? "Сохранение" : "Подтвердить"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function BinanceTradeSummary({
   amount,
   entryPrice,
@@ -3519,6 +4086,7 @@ function BinanceTradeSummary({
   markPrice,
   marketPrice,
   marginUsdt,
+  quoteAsset = "USDT",
   side,
   symbol
 }: {
@@ -3530,6 +4098,7 @@ function BinanceTradeSummary({
   markPrice: number;
   marketPrice?: number;
   marginUsdt: number;
+  quoteAsset?: string;
   side: TradeSide;
   symbol: string;
 }) {
@@ -3540,17 +4109,17 @@ function BinanceTradeSummary({
     <div className="binance-summary">
       <div className="binance-summary-head">
         <div>
-          <strong>{symbol}USDT</strong>
+          <strong>{symbol}{quoteAsset}</strong>
           <span>Perp</span>
         </div>
         <small className={side === "long" ? "positive-text" : "negative-text"}>{sideLabel}</small>
       </div>
       <div className="binance-summary-rows">
-        {marketPrice ? <SummaryRow label="Market" value={`${formatPrice(marketPrice)} USDT`} /> : null}
-        <SummaryRow label="Price" value={`${formatPrice(entryPrice)} USDT`} />
+        {marketPrice ? <SummaryRow label="Market" value={`${formatPrice(marketPrice)} ${quoteAsset}`} /> : null}
+        <SummaryRow label="Price" value={`${formatPrice(entryPrice)} ${quoteAsset}`} />
         <SummaryRow label="Amount" value={amount} />
-        <SummaryRow label="Mark Price" value={`${formatPrice(markPrice)} USDT`} />
-        <SummaryRow label="Est. Liq.Price" value={liquidationPrice ? `${formatPrice(liquidationPrice)} USDT` : "—"} />
+        <SummaryRow label="Mark Price" value={`${formatPrice(markPrice)} ${quoteAsset}`} />
+        <SummaryRow label="Est. Liq.Price" value={liquidationPrice ? `${formatPrice(liquidationPrice)} ${quoteAsset}` : "—"} />
         <SummaryRow label="Price Gap" value={`${formatPercent(priceGap)} (${formatPrice(entryPrice - markPrice)})`} />
         <SummaryRow label="Margin" value={`${formatMoney(marginUsdt)} · ${marginMode === "isolated" ? "Isolated" : "Cross"}`} />
         <SummaryRow label="Leverage" value={`${leverage}x`} />

@@ -14,6 +14,8 @@ import type {
   SituationsResponse,
   TradeClosePayload,
   TradeCreatePayload,
+  TradeExitOrder,
+  TradeExitOrderPayload,
   TradeRealizePnlPayload,
   TradesResponse
 } from "./types";
@@ -169,6 +171,26 @@ export function realizeTradePnl(tradeId: number, payload: TradeRealizePnlPayload
   return request(`/trades/${tradeId}/realize-pnl`, {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+export function createTradeExitOrder(tradeId: number, payload: TradeExitOrderPayload): Promise<{ status: string; exitOrder: TradeExitOrder }> {
+  return request(`/trades/${tradeId}/exit-orders`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateTradeExitOrder(tradeId: number, orderId: number, payload: TradeExitOrderPayload): Promise<{ status: string; exitOrder: TradeExitOrder }> {
+  return request(`/trades/${tradeId}/exit-orders/${orderId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function deleteTradeExitOrder(tradeId: number, orderId: number): Promise<{ status: string }> {
+  return request(`/trades/${tradeId}/exit-orders/${orderId}`, {
+    method: "DELETE"
   });
 }
 

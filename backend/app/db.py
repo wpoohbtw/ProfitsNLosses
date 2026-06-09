@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .portal_identity import get_default_portal_user_id
+from .portal_identity import get_legacy_owner_user_id
 
 DB_DIR = Path(__file__).resolve().parents[1] / "data"
 DB_PATH = DB_DIR / "profits_n_losses.sqlite3"
@@ -35,7 +35,7 @@ def get_connection() -> sqlite3.Connection:
 
 def initialize_database() -> None:
     with closing(get_connection()) as connection:
-        default_user_id = get_default_portal_user_id()
+        default_user_id = get_legacy_owner_user_id()
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS exchanges (
@@ -103,11 +103,28 @@ def initialize_database() -> None:
                 FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE,
                 FOREIGN KEY (exchange_id) REFERENCES exchanges(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS trade_exit_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                order_type TEXT NOT NULL CHECK (order_type IN ('take_profit', 'stop_loss')),
+                trigger_mode TEXT NOT NULL DEFAULT 'price' CHECK (trigger_mode IN ('price', 'pnl_percent')),
+                trigger_price REAL NOT NULL,
+                pnl_percent REAL NOT NULL,
+                size_mode TEXT NOT NULL DEFAULT 'percent' CHECK (size_mode IN ('percent', 'usdt')),
+                size_percent REAL NOT NULL,
+                size_usdt REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE
+            );
             """
         )
         _migrate_user_schema(connection, default_user_id)
         _seed_exchanges(connection, default_user_id)
         _migrate_trades_schema(connection)
+        _migrate_trade_exit_orders_schema(connection)
         _backfill_balance_events(connection)
         _rebuild_daily_profit_from_trade_events(connection)
         connection.commit()
@@ -371,6 +388,28 @@ def _migrate_trades_schema(connection: sqlite3.Connection) -> None:
                 ELSE size_value * entry_price
             END
         WHERE group_id IS NULL OR group_id = '' OR notional_usdt <= 0
+        """
+    )
+
+
+def _migrate_trade_exit_orders_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trade_exit_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            order_type TEXT NOT NULL CHECK (order_type IN ('take_profit', 'stop_loss')),
+            trigger_mode TEXT NOT NULL DEFAULT 'price' CHECK (trigger_mode IN ('price', 'pnl_percent')),
+            trigger_price REAL NOT NULL,
+            pnl_percent REAL NOT NULL,
+            size_mode TEXT NOT NULL DEFAULT 'percent' CHECK (size_mode IN ('percent', 'usdt')),
+            size_percent REAL NOT NULL,
+            size_usdt REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE
+        )
         """
     )
 

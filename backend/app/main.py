@@ -69,6 +69,16 @@ class TradeRealizePnl(BaseModel):
     margin_usdt: float | None = Field(default=None, gt=0)
 
 
+class TradeExitOrderPayload(BaseModel):
+    order_type: str = Field(pattern="^(take_profit|stop_loss)$")
+    trigger_mode: str = Field(default="price", pattern="^(price|pnl_percent)$")
+    trigger_price: float = Field(gt=0)
+    pnl_percent: float
+    size_mode: str = Field(default="percent", pattern="^(percent|usdt)$")
+    size_percent: float = Field(gt=0, le=100)
+    size_usdt: float = Field(gt=0)
+
+
 class ExchangeTransfer(BaseModel):
     from_exchange_id: int
     to_exchange_id: int
@@ -410,6 +420,22 @@ def calculate_trade_price_pnl(side: str, entry_price: float, exit_price: float, 
     if side == "short":
         return (entry_price - exit_price) * quantity
     return (exit_price - entry_price) * quantity
+
+
+def serialize_exit_order(row) -> dict[str, object]:
+    return {
+        "id": row["id"],
+        "tradeId": row["trade_id"],
+        "orderType": row["order_type"],
+        "triggerMode": row["trigger_mode"],
+        "triggerPrice": row["trigger_price"],
+        "pnlPercent": row["pnl_percent"],
+        "sizeMode": row["size_mode"],
+        "sizePercent": row["size_percent"],
+        "sizeUsdt": row["size_usdt"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
 
 
 def funding_interval_ms(exchange_slug: str) -> int:
@@ -879,6 +905,32 @@ def list_trades(status: str | None = "open", current_user: dict[str, object] = D
         """,
         tuple(parameters),
     )
+    trade_ids = [row["id"] for row in rows]
+    exit_orders_by_trade: dict[int, list[dict[str, object]]] = {int(trade_id): [] for trade_id in trade_ids}
+    if trade_ids:
+        placeholders = ",".join("?" for _ in trade_ids)
+        exit_order_rows = fetch_all(
+            f"""
+            SELECT
+                id,
+                trade_id,
+                order_type,
+                trigger_mode,
+                trigger_price,
+                pnl_percent,
+                size_mode,
+                size_percent,
+                size_usdt,
+                created_at,
+                updated_at
+            FROM trade_exit_orders
+            WHERE user_id = ? AND trade_id IN ({placeholders})
+            ORDER BY order_type ASC, trigger_price ASC, id ASC
+            """,
+            (user_id, *trade_ids),
+        )
+        for order_row in exit_order_rows:
+            exit_orders_by_trade.setdefault(order_row["trade_id"], []).append(serialize_exit_order(order_row))
 
     trades = [
         {
@@ -901,6 +953,7 @@ def list_trades(status: str | None = "open", current_user: dict[str, object] = D
             "realizedPnlUsdt": row["realized_pnl_usdt"],
             "lastFundingAppliedAt": row["last_funding_applied_at"],
             "comment": row["comment"],
+            "exitOrders": exit_orders_by_trade.get(row["id"], []),
             "openedAt": row["opened_at"],
             "closedAt": row["closed_at"],
             "deletedAt": row["deleted_at"],
@@ -927,6 +980,142 @@ def update_trade_group_comment(group_id: str, payload: TradeGroupComment, curren
         connection.commit()
 
     return {"status": "saved"}
+
+
+def fetch_open_trade_for_exit_order(connection, trade_id: int, user_id: int):
+    trade = connection.execute(
+        """
+        SELECT id, user_id, status, notional_usdt
+        FROM trades
+        WHERE id = ? AND user_id = ?
+        """,
+        (trade_id, user_id),
+    ).fetchone()
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    if trade["status"] != "open":
+        raise HTTPException(status_code=400, detail="TP/SL можно менять только у открытой сделки")
+    return trade
+
+
+@app.post("/api/v1/trades/{trade_id}/exit-orders")
+def create_trade_exit_order(
+    trade_id: int,
+    payload: TradeExitOrderPayload,
+    current_user: dict[str, object] = Depends(get_current_portal_user),
+) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
+    with closing(get_connection()) as connection:
+        fetch_open_trade_for_exit_order(connection, trade_id, user_id)
+        cursor = connection.execute(
+            """
+            INSERT INTO trade_exit_orders (
+                trade_id,
+                user_id,
+                order_type,
+                trigger_mode,
+                trigger_price,
+                pnl_percent,
+                size_mode,
+                size_percent,
+                size_usdt
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade_id,
+                user_id,
+                payload.order_type,
+                payload.trigger_mode,
+                payload.trigger_price,
+                payload.pnl_percent,
+                payload.size_mode,
+                payload.size_percent,
+                payload.size_usdt,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT id, trade_id, order_type, trigger_mode, trigger_price, pnl_percent, size_mode, size_percent, size_usdt, created_at, updated_at
+            FROM trade_exit_orders
+            WHERE id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+        connection.commit()
+    return {"status": "created", "exitOrder": serialize_exit_order(row)}
+
+
+@app.put("/api/v1/trades/{trade_id}/exit-orders/{order_id}")
+def update_trade_exit_order(
+    trade_id: int,
+    order_id: int,
+    payload: TradeExitOrderPayload,
+    current_user: dict[str, object] = Depends(get_current_portal_user),
+) -> dict[str, object]:
+    user_id = portal_user_id(current_user)
+    with closing(get_connection()) as connection:
+        fetch_open_trade_for_exit_order(connection, trade_id, user_id)
+        cursor = connection.execute(
+            """
+            UPDATE trade_exit_orders
+            SET order_type = ?,
+                trigger_mode = ?,
+                trigger_price = ?,
+                pnl_percent = ?,
+                size_mode = ?,
+                size_percent = ?,
+                size_usdt = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND trade_id = ? AND user_id = ?
+            """,
+            (
+                payload.order_type,
+                payload.trigger_mode,
+                payload.trigger_price,
+                payload.pnl_percent,
+                payload.size_mode,
+                payload.size_percent,
+                payload.size_usdt,
+                order_id,
+                trade_id,
+                user_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="TP/SL не найден")
+        row = connection.execute(
+            """
+            SELECT id, trade_id, order_type, trigger_mode, trigger_price, pnl_percent, size_mode, size_percent, size_usdt, created_at, updated_at
+            FROM trade_exit_orders
+            WHERE id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+        connection.commit()
+    return {"status": "saved", "exitOrder": serialize_exit_order(row)}
+
+
+@app.delete("/api/v1/trades/{trade_id}/exit-orders/{order_id}")
+def delete_trade_exit_order(
+    trade_id: int,
+    order_id: int,
+    current_user: dict[str, object] = Depends(get_current_portal_user),
+) -> dict[str, str]:
+    user_id = portal_user_id(current_user)
+    with closing(get_connection()) as connection:
+        fetch_open_trade_for_exit_order(connection, trade_id, user_id)
+        cursor = connection.execute(
+            """
+            DELETE FROM trade_exit_orders
+            WHERE id = ? AND trade_id = ? AND user_id = ?
+            """,
+            (order_id, trade_id, user_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="TP/SL не найден")
+        connection.commit()
+    return {"status": "deleted"}
 
 
 @app.post("/api/v1/trades/{trade_id}/close")
@@ -989,6 +1178,7 @@ def close_trade(trade_id: int, payload: TradeClose, current_user: dict[str, obje
                 user_id,
             ),
         )
+        connection.execute("DELETE FROM trade_exit_orders WHERE trade_id = ? AND user_id = ?", (trade_id, user_id))
         apply_trade_pnl_delta(
             connection=connection,
             exchange_id=trade["exchange_id"],
@@ -1082,6 +1272,7 @@ def revert_closed_trade(trade_id: int, current_user: dict[str, object] = Depends
             """,
             (trade_id, user_id),
         )
+        connection.execute("DELETE FROM trade_exit_orders WHERE trade_id = ? AND user_id = ?", (trade_id, user_id))
         connection.commit()
 
     return {"status": "reverted"}
@@ -1128,6 +1319,7 @@ def delete_trade(trade_id: int, current_user: dict[str, object] = Depends(get_cu
             """,
             (trade_id, user_id),
         )
+        connection.execute("DELETE FROM trade_exit_orders WHERE trade_id = ? AND user_id = ?", (trade_id, user_id))
         connection.commit()
 
     return {"status": "deleted"}

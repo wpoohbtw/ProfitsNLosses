@@ -49,6 +49,7 @@ GATE_REST_BASE = "https://api.gateio.ws/api/v4"
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 HYPERLIQUID_REST_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
+HYPERLIQUID_HIP3_DEXES = ("xyz",)
 KUCOIN_REST_BASE = "https://api-futures.kucoin.com"
 KUCOIN_UA_REST_BASE = "https://api.kucoin.com"
 KUCOIN_WS_URL = "wss://ws-api-futures.kucoin.com"
@@ -347,7 +348,18 @@ def fetch_hyperliquid_symbols() -> list[dict[str, object]]:
             continue
         base_asset = str(item.get("name") or "")
         if base_asset:
-            symbols.append(make_symbol("hyperliquid", base_asset, base_asset, base_asset))
+            symbols.append(make_symbol("hyperliquid", base_asset, base_asset, base_asset, "USDC"))
+
+    for dex in HYPERLIQUID_HIP3_DEXES:
+        dex_payload = post_json(HYPERLIQUID_REST_URL, {"type": "meta", "dex": dex})
+        for item in dex_payload.get("universe", []):
+            if item.get("isDelisted"):
+                continue
+            wire_symbol = str(item.get("name") or "")
+            if not wire_symbol.startswith(f"{dex}:"):
+                continue
+            base_asset = wire_symbol.split(":", 1)[1]
+            symbols.append(make_symbol("hyperliquid", base_asset, wire_symbol, base_asset, "USDC"))
     return sorted(symbols, key=lambda item: str(item["symbol"]))
 
 
@@ -433,7 +445,12 @@ def resolve_wire_symbol(exchange_slug: str, symbol: str) -> str:
         base_asset = "XBT" if normalized_symbol in {"BTC", "XBT"} else normalized_symbol
         return f"{base_asset}USDTM"
     if exchange_slug == "hyperliquid":
-        return normalized_symbol.removesuffix("USDT")
+        if ":" in symbol:
+            dex, asset = symbol.strip().split(":", 1)
+            normalized_asset = asset.strip().upper().replace("/", "").replace("-", "_")
+            base_asset = normalized_asset.removesuffix("_USDT").removesuffix("_USDC").removesuffix("USDT").removesuffix("USDC")
+            return f"{dex.lower()}:{base_asset}"
+        return normalized_symbol.removesuffix("_USDT").removesuffix("_USDC").removesuffix("USDT").removesuffix("USDC")
     return normalized_symbol
 
 
@@ -449,7 +466,23 @@ def to_display_symbol(exchange_slug: str, wire_symbol: str) -> str:
         return "BTC" if base_asset == "XBT" else base_asset
     if exchange_slug == "okx" and wire_symbol.endswith("-USDT-SWAP"):
         return wire_symbol.removesuffix("-USDT-SWAP")
+    if exchange_slug == "hyperliquid" and ":" in wire_symbol:
+        return wire_symbol.split(":", 1)[1]
     return wire_symbol
+
+
+def quote_asset_for_symbol(exchange_slug: str, wire_symbol: str) -> str:
+    if exchange_slug == "hyperliquid":
+        return "USDC"
+    if exchange_slug == "okx" and wire_symbol.endswith("-USDT-SWAP"):
+        return "USDT"
+    return "USDT"
+
+
+def hyperliquid_dex_for_symbol(wire_symbol: str) -> str | None:
+    if ":" not in wire_symbol:
+        return None
+    return wire_symbol.split(":", 1)[0]
 
 
 def normalize_level(row: Any) -> dict[str, float]:
@@ -511,6 +544,7 @@ def build_snapshot(
         "exchangeSlug": exchange_slug,
         "symbol": to_display_symbol(exchange_slug, wire_symbol),
         "wireSymbol": wire_symbol,
+        "quoteAsset": quote_asset_for_symbol(exchange_slug, wire_symbol),
         "lastPrice": resolved_last_price,
         "bestBid": best_bid,
         "bestAsk": best_ask,
@@ -579,7 +613,11 @@ def fetch_gate_snapshot(wire_symbol: str) -> dict[str, object]:
 
 def fetch_hyperliquid_snapshot(wire_symbol: str) -> dict[str, object]:
     depth = post_json(HYPERLIQUID_REST_URL, {"type": "l2Book", "coin": wire_symbol})
-    mids = post_json(HYPERLIQUID_REST_URL, {"type": "allMids"})
+    mids_payload = {"type": "allMids"}
+    dex = hyperliquid_dex_for_symbol(wire_symbol)
+    if dex:
+        mids_payload["dex"] = dex
+    mids = post_json(HYPERLIQUID_REST_URL, mids_payload)
     levels = depth.get("levels", [[], []])
     return build_snapshot("hyperliquid", wire_symbol, float(mids.get(wire_symbol) or 0), normalize_levels(levels[0] if levels else []), normalize_levels(levels[1] if len(levels) > 1 else []), "rest", depth.get("time"))
 
@@ -866,7 +904,11 @@ def fetch_gate_funding(wire_symbol: str) -> dict[str, object]:
 
 
 def fetch_hyperliquid_funding(wire_symbol: str) -> dict[str, object]:
-    payload = post_json(HYPERLIQUID_REST_URL, {"type": "metaAndAssetCtxs"})
+    payload_request = {"type": "metaAndAssetCtxs"}
+    dex = hyperliquid_dex_for_symbol(wire_symbol)
+    if dex:
+        payload_request["dex"] = dex
+    payload = post_json(HYPERLIQUID_REST_URL, payload_request)
     universe = payload[0].get("universe", []) if isinstance(payload, list) and payload else []
     contexts = payload[1] if isinstance(payload, list) and len(payload) > 1 else []
     funding_rate = 0.0
