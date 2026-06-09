@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import time
 from typing import Annotated
 
@@ -444,18 +444,21 @@ def funding_interval_ms(exchange_slug: str) -> int:
 
 
 def timestamp_ms_to_sqlite(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def timestamp_ms_to_date(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(timestamp_ms / 1000).date().isoformat()
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).date().isoformat()
 
 
 def parse_sqlite_timestamp_ms(value: str | None) -> int:
     if not value:
         return int(time.time() * 1000)
     try:
-        return int(datetime.fromisoformat(value.replace(" ", "T")).timestamp() * 1000)
+        parsed = datetime.fromisoformat(value.replace(" ", "T"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
     except ValueError:
         return int(time.time() * 1000)
 

@@ -2496,12 +2496,13 @@ function TradeTicketCard({ exchanges, openPositions, ticket, onRemove, onUpdate,
   const exchange = exchanges.find((item) => item.id === ticket.exchangeId);
   const selectedToken = TOKENS.find((token) => token.symbol === ticket.symbol);
   const normalizedTokenQuery = ticket.tokenQuery.trim().toUpperCase();
+  const [isTokenFieldFocused, setIsTokenFieldFocused] = useState(false);
   const [marketSymbols, setMarketSymbols] = useState<MarketSymbol[]>([]);
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [marketStatus, setMarketStatus] = useState<string | null>(null);
   const liveEnabled = isLiveExchange(exchange);
   const suggestions = getTokenSuggestions(ticket.tokenQuery, liveEnabled ? marketSymbols : []);
-  const showTokenSuggestions = Boolean(normalizedTokenQuery) && ticket.symbol !== normalizedTokenQuery && suggestions.length > 0;
+  const showTokenSuggestions = isTokenFieldFocused && Boolean(normalizedTokenQuery) && ticket.symbol !== normalizedTokenQuery && suggestions.length > 0;
   const activeMarketSymbol = ticket.symbol || (normalizedTokenQuery.length >= 2 ? normalizedTokenQuery : "");
   const price = numberFromInput(ticket.price);
   const notional = getTicketNotional(ticket);
@@ -2650,12 +2651,14 @@ function TradeTicketCard({ exchanges, openPositions, ticket, onRemove, onUpdate,
         <input
           value={ticket.tokenQuery}
           onChange={(event) => onUpdate(ticket.id, { tokenQuery: event.target.value.toUpperCase(), symbol: "", message: null })}
+          onBlur={() => setIsTokenFieldFocused(false)}
+          onFocus={() => setIsTokenFieldFocused(true)}
           placeholder="BTC"
         />
         {showTokenSuggestions ? (
           <div className="token-suggestions">
             {suggestions.map((token) => (
-              <button key={token.symbol} type="button" onClick={() => setToken(token)}>
+              <button key={token.symbol} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => setToken(token)}>
                 <strong>{token.symbol}</strong>
                 <span>{token.name}</span>
               </button>
@@ -2821,6 +2824,7 @@ function OpenPositionsPanel({
   onToggleSymbol,
   onPositionSnapshot
 }: OpenPositionsPanelProps) {
+  const [now, setNow] = useState(() => Date.now());
   const [marketStatuses, setMarketStatuses] = useState<Record<number, string | null>>({});
   const [fundingInfos, setFundingInfos] = useState<Record<number, FundingInfo>>({});
   const groupedPositions = positions.reduce<Record<string, OpenPosition[]>>((groups, position) => {
@@ -2833,6 +2837,11 @@ function OpenPositionsPanel({
   }, []);
   const handleFundingInfo = useCallback((positionId: number, fundingInfo: FundingInfo) => {
     setFundingInfos((current) => ({ ...current, [positionId]: fundingInfo }));
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -2903,22 +2912,25 @@ function OpenPositionsPanel({
                 </button>
 
                 {isExpanded ? (
-                  <div className="open-position-cards">
-                    {symbolPositions.map((position) => (
-                      <OpenPositionCard
-                        exchange={exchanges.find((exchange) => exchange.id === position.exchangeId)}
-                        key={position.id}
-                        positions={positions}
-                        position={position}
-                        fundingInfo={fundingInfos[position.id] ?? null}
-                        snapshot={snapshots[position.id] ?? null}
-                        status={marketStatuses[position.id] ?? null}
-                        onCloseTrade={onCloseTrade}
-                        onExitOrder={onExitOrder}
-                        onDeleteTrade={onDeleteTrade}
-                      />
-                    ))}
-                  </div>
+                  <>
+                    <div className="open-position-cards">
+                      {symbolPositions.map((position) => (
+                        <OpenPositionCard
+                          exchange={exchanges.find((exchange) => exchange.id === position.exchangeId)}
+                          key={position.id}
+                          positions={positions}
+                          position={position}
+                          fundingInfo={fundingInfos[position.id] ?? null}
+                          snapshot={snapshots[position.id] ?? null}
+                          status={marketStatuses[position.id] ?? null}
+                          onCloseTrade={onCloseTrade}
+                          onExitOrder={onExitOrder}
+                          onDeleteTrade={onDeleteTrade}
+                        />
+                      ))}
+                    </div>
+                    <PositionSpreadSummary fundingInfos={fundingInfos} now={now} positions={symbolPositions} snapshots={snapshots} />
+                  </>
                 ) : null}
               </article>
             );
@@ -2940,6 +2952,146 @@ type OpenPositionCardProps = {
   onExitOrder: (position: OpenPosition, order?: TradeExitOrder | null) => void;
   onDeleteTrade: (position: OpenPosition) => void;
 };
+
+type PositionSpreadPair = {
+  id: string;
+  longPosition: OpenPosition;
+  shortPosition: OpenPosition;
+  entrySpreadUsdt: number;
+  entrySpreadPercent: number;
+  priceSpreadUsdt: number;
+  priceSpreadPercent: number;
+  fundingNetUsdt: number;
+  fundingRateImpactPercent: number;
+  nextFundingTime: number | null;
+  fundingLegCount: number;
+};
+
+function getFundingPnlEstimate(position: OpenPosition, fundingInfo: FundingInfo): number {
+  const direction = position.side === "long" ? -1 : 1;
+  return position.notionalUsdt * fundingInfo.fundingRate * direction;
+}
+
+function DirectionBadge({ side }: { side: TradeSide }) {
+  const isLong = side === "long";
+  return (
+    <span className={isLong ? "direction-badge is-long" : "direction-badge is-short"}>
+      {isLong ? <ArrowUp size={13} /> : <ArrowDown size={13} />}
+      <span>{isLong ? "LONG" : "SHORT"}</span>
+    </span>
+  );
+}
+
+function getPositionSpreadPairs(
+  positions: OpenPosition[],
+  snapshots: Record<number, MarketSnapshot>,
+  fundingInfos: Record<number, FundingInfo>,
+  now: number
+): PositionSpreadPair[] {
+  const longs = positions.filter((position) => position.side === "long");
+  const shorts = positions.filter((position) => position.side === "short");
+  const pairs: PositionSpreadPair[] = [];
+
+  for (const longPosition of longs) {
+    for (const shortPosition of shorts) {
+      const longClosePrice = getPositionClosePrice(longPosition, snapshots[longPosition.id] ?? null);
+      const shortClosePrice = getPositionClosePrice(shortPosition, snapshots[shortPosition.id] ?? null);
+      const entrySpreadUsdt = shortPosition.entryPrice - longPosition.entryPrice;
+      const entryAveragePrice = (shortPosition.entryPrice + longPosition.entryPrice) / 2;
+      const entrySpreadPercent = entryAveragePrice > 0 ? (entrySpreadUsdt / entryAveragePrice) * 100 : 0;
+      const priceSpreadUsdt = shortClosePrice - longClosePrice;
+      const averagePrice = (shortClosePrice + longClosePrice) / 2;
+      const priceSpreadPercent = averagePrice > 0 ? (priceSpreadUsdt / averagePrice) * 100 : 0;
+      const fundingLegs = [longPosition, shortPosition]
+        .map((position) => ({ position, fundingInfo: fundingInfos[position.id] }))
+        .filter((item): item is { position: OpenPosition; fundingInfo: FundingInfo } => Boolean(item.fundingInfo?.nextFundingTime));
+      const futureFundingLegs = fundingLegs.filter((item) => item.fundingInfo.nextFundingTime > now);
+      const nextFundingTime = futureFundingLegs.length
+        ? Math.min(...futureFundingLegs.map((item) => item.fundingInfo.nextFundingTime))
+        : null;
+      const nearestFundingLegs = nextFundingTime
+        ? futureFundingLegs.filter((item) => Math.abs(item.fundingInfo.nextFundingTime - nextFundingTime) <= 60_000)
+        : [];
+      const fundingNetUsdt = nearestFundingLegs.reduce((sum, item) => sum + getFundingPnlEstimate(item.position, item.fundingInfo), 0);
+      const fundingNotional = nearestFundingLegs.reduce((sum, item) => sum + item.position.notionalUsdt, 0);
+      const fundingRateImpactPercent = fundingNotional > 0 ? (fundingNetUsdt / fundingNotional) * 100 : 0;
+
+      pairs.push({
+        id: `${longPosition.id}-${shortPosition.id}`,
+        longPosition,
+        shortPosition,
+        entrySpreadUsdt,
+        entrySpreadPercent,
+        priceSpreadUsdt,
+        priceSpreadPercent,
+        fundingNetUsdt,
+        fundingRateImpactPercent,
+        nextFundingTime,
+        fundingLegCount: nearestFundingLegs.length
+      });
+    }
+  }
+
+  return pairs;
+}
+
+function PositionSpreadSummary({
+  fundingInfos,
+  now,
+  positions,
+  snapshots
+}: {
+  fundingInfos: Record<number, FundingInfo>;
+  now: number;
+  positions: OpenPosition[];
+  snapshots: Record<number, MarketSnapshot>;
+}) {
+  const pairs = getPositionSpreadPairs(positions, snapshots, fundingInfos, now);
+  if (pairs.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="position-spread-card">
+      {pairs.map((pair) => {
+        const priceTone = pair.priceSpreadUsdt >= 0 ? "positive-text" : "negative-text";
+        const fundingTone = pair.fundingNetUsdt >= 0 ? "positive-text" : "negative-text";
+        return (
+          <div className="position-spread-row" key={pair.id}>
+            <div className="position-spread-pair">
+              <ExchangeIcon exchange={{ slug: pair.longPosition.exchangeSlug, name: pair.longPosition.exchangeName }} className="compact" />
+              <DirectionBadge side="long" />
+              <ExchangeIcon exchange={{ slug: pair.shortPosition.exchangeSlug, name: pair.shortPosition.exchangeName }} className="compact" />
+              <DirectionBadge side="short" />
+            </div>
+            <div className="position-spread-metric">
+              <span>Spread in:</span>
+              <strong>
+                {formatPercent(pair.entrySpreadPercent)}
+                <small>{formatPrice(pair.entrySpreadUsdt)}</small>
+              </strong>
+            </div>
+            <div className="position-spread-metric">
+              <span>Spread out:</span>
+              <strong className={priceTone}>
+                {formatPercent(pair.priceSpreadPercent)}
+                <small>{formatPrice(pair.priceSpreadUsdt)}</small>
+              </strong>
+            </div>
+            <div className="position-spread-metric">
+              <span>Фандинг:</span>
+              <strong className={fundingTone}>
+                {pair.fundingLegCount > 0 ? formatSigned(pair.fundingNetUsdt) : "—"}
+                {pair.fundingLegCount > 0 ? <small>{formatPercent(pair.fundingRateImpactPercent)}</small> : null}
+              </strong>
+              <em>{pair.nextFundingTime ? formatFundingCountdown(pair.nextFundingTime, now) : "--:--:--"}</em>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function PositionMarketFeed({
   position,
@@ -3046,7 +3198,6 @@ function PositionFundingFeed({
 function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot, status, onCloseTrade, onExitOrder, onDeleteTrade }: OpenPositionCardProps) {
   const [now, setNow] = useState(() => Date.now());
   const pnl = getPositionPnl(position, snapshot);
-  const quantity = getPositionQuantity(position);
   const liquidationPrice = getPositionLiquidationPrice(position, positions, exchange);
 
   useEffect(() => {
@@ -3074,7 +3225,7 @@ function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot
         </div>
         <div>
           <span>Направление</span>
-          <strong className={position.side === "long" ? "positive-text" : "negative-text"}>{position.side.toUpperCase()}</strong>
+          <DirectionBadge side={position.side} />
         </div>
         <div>
           <span>ТВХ</span>
@@ -3082,11 +3233,7 @@ function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot
         </div>
         <div>
           <span>Сайз</span>
-          <strong>{compactFormatter.format(position.sizeValue)} {position.sizeUnit}</strong>
-        </div>
-        <div>
-          <span>Кол-во</span>
-          <strong>{compactFormatter.format(quantity)} {position.symbol}</strong>
+          <strong>{compactFormatter.format(position.sizeValue)} {position.sizeUnit === "TOKEN" ? position.symbol : position.sizeUnit}</strong>
         </div>
         <div>
           <span>Маржа</span>
@@ -3095,10 +3242,6 @@ function OpenPositionCard({ exchange, positions, position, fundingInfo, snapshot
         <div>
           <span>Режим</span>
           <strong>{position.marginMode === "isolated" ? "Isolated" : "Cross"}</strong>
-        </div>
-        <div>
-          <span>Закрытие маркетом</span>
-          <strong>{formatPrice(pnl.closePrice)}</strong>
         </div>
         <div>
           <span>Est. liq</span>
@@ -3152,16 +3295,36 @@ function getTokenSuggestions(query: string, marketSymbols: MarketSymbol[] = []):
     return [];
   }
 
+  const sortByMatchQuality = (left: TokenMock, right: TokenMock) => {
+    const score = (token: TokenMock) => {
+      const symbol = token.symbol.toUpperCase();
+      const name = token.name.toUpperCase();
+      if (symbol === normalized) return 0;
+      if (symbol.startsWith(normalized)) return 1;
+      if (symbol.includes(normalized)) return 2;
+      if (name.startsWith(normalized)) return 3;
+      if (name.includes(normalized)) return 4;
+      return 5;
+    };
+    return score(left) - score(right) || left.symbol.localeCompare(right.symbol);
+  };
+
   if (marketSymbols.length > 0) {
-    return marketSymbols.map((symbol) => ({
-      symbol: symbol.symbol,
-      wireSymbol: symbol.wireSymbol,
-      name: symbol.displayName,
-      lastPrice: 0
-    }));
+    return marketSymbols
+      .map((symbol) => ({
+        symbol: symbol.symbol,
+        wireSymbol: symbol.wireSymbol,
+        name: symbol.displayName,
+        lastPrice: 0
+      }))
+      .sort(sortByMatchQuality)
+      .slice(0, 6);
   }
 
-  return TOKENS.filter((token) => token.symbol.includes(normalized) || token.name.toUpperCase().includes(normalized)).slice(0, 6);
+  return TOKENS
+    .filter((token) => token.symbol.includes(normalized) || token.name.toUpperCase().includes(normalized))
+    .sort(sortByMatchQuality)
+    .slice(0, 6);
 }
 
 function roundInput(value: number): number {
