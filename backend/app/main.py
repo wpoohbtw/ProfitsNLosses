@@ -92,7 +92,7 @@ class TradeGroupComment(BaseModel):
 class SituationCreate(BaseModel):
     date: str = Field(min_length=1, max_length=32)
     token: str = Field(min_length=1, max_length=32)
-    description: str = Field(min_length=1, max_length=1000)
+    description: str = Field(min_length=1, max_length=30000)
     posts: str = Field(default="", max_length=2000)
 
 
