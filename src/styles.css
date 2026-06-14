@@ -765,6 +765,22 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.situation-expand-button {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  font: inherit;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.situation-expand-button:hover {
+  color: var(--text);
+}
+
 .situation-edit-button,
 .situation-delete-button {
   width: 42px;

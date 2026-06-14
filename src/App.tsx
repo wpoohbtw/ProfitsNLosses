@@ -74,6 +74,8 @@ import type {
 
 type PageId = "exchanges" | "trades" | "deals" | "situations";
 
+const SITUATION_DESCRIPTION_PREVIEW_LENGTH = 700;
+
 type TokenMock = {
   symbol: string;
   name: string;
@@ -2200,6 +2202,7 @@ function SituationsPage({
 }) {
   const [searchDraft, setSearchDraft] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
+  const [expandedDescriptions, setExpandedDescriptions] = useState<Record<number, boolean>>({});
   const filteredSituations = useMemo(() => {
     const query = appliedSearch.trim().toLowerCase();
     if (!query) {
@@ -2274,28 +2277,51 @@ function SituationsPage({
           <div className="open-positions-empty">{emptyText}</div>
         ) : (
           <div className="situations-list">
-            {filteredSituations.map((situation) => (
-              <article className="situation-row" key={situation.rowNumber}>
-                <div className="situation-row-main">
-                  <span>{situation.date}</span>
-                  <strong>{situation.token}</strong>
-                </div>
-                <div className="situation-row-text">
-                  <span>Описание</span>
-                  <p>{situation.description}</p>
-                </div>
-                <div className="situation-row-text">
-                  <span>Посты</span>
-                  <p>{situation.posts || "—"}</p>
-                </div>
-                <button className="situation-edit-button" type="button" onClick={() => onEdit(situation)} disabled={isSaving} aria-label="Редактировать ситуацию">
-                  <SquarePen size={16} />
-                </button>
-                <button className="situation-delete-button" type="button" onClick={() => onDelete(situation)} disabled={isSaving} aria-label="Удалить ситуацию">
-                  <Trash2 size={16} />
-                </button>
-              </article>
-            ))}
+            {filteredSituations.map((situation) => {
+              const isDescriptionLong = situation.description.length > SITUATION_DESCRIPTION_PREVIEW_LENGTH;
+              const isDescriptionExpanded = Boolean(expandedDescriptions[situation.rowNumber]);
+              const visibleDescription =
+                isDescriptionLong && !isDescriptionExpanded
+                  ? `${situation.description.slice(0, SITUATION_DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
+                  : situation.description;
+
+              return (
+                <article className="situation-row" key={situation.rowNumber}>
+                  <div className="situation-row-main">
+                    <span>{situation.date}</span>
+                    <strong>{situation.token}</strong>
+                  </div>
+                  <div className="situation-row-text">
+                    <span>Описание</span>
+                    <p>{visibleDescription}</p>
+                    {isDescriptionLong ? (
+                      <button
+                        className="situation-expand-button"
+                        type="button"
+                        onClick={() =>
+                          setExpandedDescriptions((current) => ({
+                            ...current,
+                            [situation.rowNumber]: !isDescriptionExpanded
+                          }))
+                        }
+                      >
+                        {isDescriptionExpanded ? "Свернуть" : "Развернуть"}
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="situation-row-text">
+                    <span>Посты</span>
+                    <p>{situation.posts || "—"}</p>
+                  </div>
+                  <button className="situation-edit-button" type="button" onClick={() => onEdit(situation)} disabled={isSaving} aria-label="Редактировать ситуацию">
+                    <SquarePen size={16} />
+                  </button>
+                  <button className="situation-delete-button" type="button" onClick={() => onDelete(situation)} disabled={isSaving} aria-label="Удалить ситуацию">
+                    <Trash2 size={16} />
+                  </button>
+                </article>
+              );
+            })}
           </div>
         )}
       </div>
