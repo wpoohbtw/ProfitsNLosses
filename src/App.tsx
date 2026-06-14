@@ -74,7 +74,7 @@ import type {
 
 type PageId = "exchanges" | "trades" | "deals" | "situations";
 
-const SITUATION_TEXT_PREVIEW_LENGTH = 700;
+const SITUATION_TEXT_PREVIEW_LENGTH = 520;
 
 type TokenMock = {
   symbol: string;
@@ -2298,11 +2298,11 @@ function SituationsPage({
                     <span>{situation.date}</span>
                     <strong>{situation.token}</strong>
                   </div>
-                  <div className="situation-row-text">
+                  <div className={shouldShowExpand && !isSituationExpanded ? "situation-row-text is-collapsed" : "situation-row-text"}>
                     <span>Описание</span>
                     <p>{visibleDescription}</p>
                   </div>
-                  <div className="situation-row-text">
+                  <div className={shouldShowExpand && !isSituationExpanded ? "situation-row-text is-collapsed" : "situation-row-text"}>
                     <span>Посты</span>
                     <p>{visiblePosts}</p>
                   </div>

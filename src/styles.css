@@ -765,6 +765,11 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.situation-row-text.is-collapsed p {
+  max-height: calc(1.45em * 14);
+  overflow: hidden;
+}
+
 .situation-expand-button {
   justify-self: start;
   padding: 0;
@@ -797,6 +802,16 @@ h2 {
   color: var(--muted);
   background: var(--surface-strong);
   transition: transform 180ms ease, border-color 180ms ease, color 180ms ease;
+}
+
+.situation-edit-button {
+  grid-column: 4;
+  grid-row: 1;
+}
+
+.situation-delete-button {
+  grid-column: 5;
+  grid-row: 1;
 }
 
 .situation-edit-button:hover {
