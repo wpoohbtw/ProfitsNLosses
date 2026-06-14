@@ -74,7 +74,7 @@ import type {
 
 type PageId = "exchanges" | "trades" | "deals" | "situations";
 
-const SITUATION_DESCRIPTION_PREVIEW_LENGTH = 700;
+const SITUATION_TEXT_PREVIEW_LENGTH = 700;
 
 type TokenMock = {
   symbol: string;
@@ -2202,7 +2202,7 @@ function SituationsPage({
 }) {
   const [searchDraft, setSearchDraft] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
-  const [expandedDescriptions, setExpandedDescriptions] = useState<Record<number, boolean>>({});
+  const [expandedSituations, setExpandedSituations] = useState<Record<number, boolean>>({});
   const filteredSituations = useMemo(() => {
     const query = appliedSearch.trim().toLowerCase();
     if (!query) {
@@ -2278,12 +2278,19 @@ function SituationsPage({
         ) : (
           <div className="situations-list">
             {filteredSituations.map((situation) => {
-              const isDescriptionLong = situation.description.length > SITUATION_DESCRIPTION_PREVIEW_LENGTH;
-              const isDescriptionExpanded = Boolean(expandedDescriptions[situation.rowNumber]);
+              const postsText = situation.posts || "—";
+              const isDescriptionLong = situation.description.length > SITUATION_TEXT_PREVIEW_LENGTH;
+              const arePostsLong = postsText.length > SITUATION_TEXT_PREVIEW_LENGTH;
+              const isSituationExpanded = Boolean(expandedSituations[situation.rowNumber]);
+              const shouldShowExpand = isDescriptionLong || arePostsLong;
               const visibleDescription =
-                isDescriptionLong && !isDescriptionExpanded
-                  ? `${situation.description.slice(0, SITUATION_DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
+                isDescriptionLong && !isSituationExpanded
+                  ? `${situation.description.slice(0, SITUATION_TEXT_PREVIEW_LENGTH).trimEnd()}...`
                   : situation.description;
+              const visiblePosts =
+                arePostsLong && !isSituationExpanded
+                  ? `${postsText.slice(0, SITUATION_TEXT_PREVIEW_LENGTH).trimEnd()}...`
+                  : postsText;
 
               return (
                 <article className="situation-row" key={situation.rowNumber}>
@@ -2294,25 +2301,25 @@ function SituationsPage({
                   <div className="situation-row-text">
                     <span>Описание</span>
                     <p>{visibleDescription}</p>
-                    {isDescriptionLong ? (
-                      <button
-                        className="situation-expand-button"
-                        type="button"
-                        onClick={() =>
-                          setExpandedDescriptions((current) => ({
-                            ...current,
-                            [situation.rowNumber]: !isDescriptionExpanded
-                          }))
-                        }
-                      >
-                        {isDescriptionExpanded ? "Свернуть" : "Развернуть"}
-                      </button>
-                    ) : null}
                   </div>
                   <div className="situation-row-text">
                     <span>Посты</span>
-                    <p>{situation.posts || "—"}</p>
+                    <p>{visiblePosts}</p>
                   </div>
+                  {shouldShowExpand ? (
+                    <button
+                      className="situation-expand-button situation-row-expand-button"
+                      type="button"
+                      onClick={() =>
+                        setExpandedSituations((current) => ({
+                          ...current,
+                          [situation.rowNumber]: !isSituationExpanded
+                        }))
+                      }
+                    >
+                      {isSituationExpanded ? "Свернуть" : "Развернуть"}
+                    </button>
+                  ) : null}
                   <button className="situation-edit-button" type="button" onClick={() => onEdit(situation)} disabled={isSaving} aria-label="Редактировать ситуацию">
                     <SquarePen size={16} />
                   </button>
